@@ -1,0 +1,1600 @@
+{
+  "units": "metres",
+  "up_axis": "Y",
+  "coordinate_note": "Matches the .glb files (Y-up). Colliders are axis-aligned boxes in model-local space; origin is the footprint centre on the ground plane.",
+  "rapier_note": "half_extents feed RAPIER.ColliderDesc.cuboid(hx,hy,hz) directly. center is the box centre relative to the building's spawn point. Filter by tag=='body' if you want buildings solid but props pass-through.",
+  "buildings": [
+    {
+      "name": "bld_tenement_01",
+      "kind": "tenement",
+      "mesh": "bld_tenement_01.glb",
+      "footprint_xz": [
+        15,
+        16
+      ],
+      "roof_y": 28.0,
+      "landing_decks_y": [
+        28.0
+      ],
+      "total_height_y": 33.28,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.0,
+            0.0
+          ],
+          "half_extents": [
+            7.5,
+            14.0,
+            8.0
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -0.465,
+            30.642,
+            -1.082
+          ],
+          "half_extents": [
+            1.254,
+            2.642,
+            1.254
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            1.828,
+            28.363,
+            4.021
+          ],
+          "half_extents": [
+            0.701,
+            0.363,
+            0.525
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -4.698,
+            28.509,
+            -1.221
+          ],
+          "half_extents": [
+            0.982,
+            0.509,
+            0.736
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            0.223,
+            28.482,
+            -4.8
+          ],
+          "half_extents": [
+            0.928,
+            0.481,
+            0.696
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            -3.211,
+            29.683,
+            4.252
+          ],
+          "half_extents": [
+            0.095,
+            1.683,
+            0.095
+          ]
+        }
+      ],
+      "collider_count": 6,
+      "prop_count": 5,
+      "tris": 1084
+    },
+    {
+      "name": "bld_walkup_01",
+      "kind": "walkup",
+      "mesh": "bld_walkup_01.glb",
+      "footprint_xz": [
+        14,
+        16
+      ],
+      "roof_y": 28.2,
+      "landing_decks_y": [
+        28.2
+      ],
+      "total_height_y": 33.66,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.1,
+            0.0
+          ],
+          "half_extents": [
+            7.0,
+            14.1,
+            8.0
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -2.804,
+            30.928,
+            3.205
+          ],
+          "half_extents": [
+            1.296,
+            2.728,
+            1.296
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            1.679,
+            30.421,
+            -3.48
+          ],
+          "half_extents": [
+            1.054,
+            2.221,
+            1.054
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            0.963,
+            30.552,
+            1.832
+          ],
+          "half_extents": [
+            1.117,
+            2.352,
+            1.117
+          ]
+        }
+      ],
+      "collider_count": 4,
+      "prop_count": 3,
+      "tris": 1356
+    },
+    {
+      "name": "bld_deco_01",
+      "kind": "deco",
+      "mesh": "bld_deco_01.glb",
+      "footprint_xz": [
+        18,
+        18
+      ],
+      "roof_y": 28.4,
+      "landing_decks_y": [
+        28.4,
+        31.52
+      ],
+      "total_height_y": 37.35,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.2,
+            0.0
+          ],
+          "half_extents": [
+            9.0,
+            14.2,
+            9.0
+          ]
+        },
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            29.96,
+            0.0
+          ],
+          "half_extents": [
+            6.66,
+            1.56,
+            6.66
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -2.691,
+            28.875,
+            0.919
+          ],
+          "half_extents": [
+            0.917,
+            0.475,
+            0.688
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            3.712,
+            29.419,
+            0.178
+          ],
+          "half_extents": [
+            1.157,
+            1.02,
+            0.968
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            0.409,
+            32.624,
+            -2.048
+          ],
+          "half_extents": [
+            1.256,
+            1.107,
+            1.05
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -2.317,
+            31.966,
+            0.666
+          ],
+          "half_extents": [
+            0.867,
+            0.45,
+            0.65
+          ]
+        }
+      ],
+      "collider_count": 6,
+      "prop_count": 4,
+      "tris": 628
+    },
+    {
+      "name": "bld_glass_01",
+      "kind": "glass",
+      "mesh": "bld_glass_01.glb",
+      "footprint_xz": [
+        16,
+        16
+      ],
+      "roof_y": 28.6,
+      "landing_decks_y": [
+        28.6
+      ],
+      "total_height_y": 32.89,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.3,
+            0.0
+          ],
+          "half_extents": [
+            8.0,
+            14.3,
+            8.0
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            -0.53,
+            30.638,
+            1.343
+          ],
+          "half_extents": [
+            0.115,
+            2.038,
+            0.115
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            1.888,
+            30.261,
+            -1.307
+          ],
+          "half_extents": [
+            0.093,
+            1.661,
+            0.093
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            4.526,
+            29.059,
+            -4.122
+          ],
+          "half_extents": [
+            0.884,
+            0.459,
+            0.663
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -1.728,
+            30.744,
+            -4.357
+          ],
+          "half_extents": [
+            1.018,
+            2.144,
+            1.018
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            3.996,
+            28.958,
+            3.907
+          ],
+          "half_extents": [
+            0.689,
+            0.357,
+            0.517
+          ]
+        }
+      ],
+      "collider_count": 6,
+      "prop_count": 5,
+      "tris": 684
+    },
+    {
+      "name": "bld_deco_02",
+      "kind": "deco",
+      "mesh": "bld_deco_02.glb",
+      "footprint_xz": [
+        21,
+        21
+      ],
+      "roof_y": 28.8,
+      "landing_decks_y": [
+        28.8,
+        31.96
+      ],
+      "total_height_y": 37.79,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.4,
+            0.0
+          ],
+          "half_extents": [
+            10.5,
+            14.4,
+            10.5
+          ]
+        },
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            30.38,
+            0.0
+          ],
+          "half_extents": [
+            7.77,
+            1.58,
+            7.77
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            1.73,
+            29.139,
+            -4.671
+          ],
+          "half_extents": [
+            0.654,
+            0.339,
+            0.49
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -2.598,
+            29.228,
+            -3.049
+          ],
+          "half_extents": [
+            0.825,
+            0.428,
+            0.619
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -2.936,
+            31.507,
+            5.717
+          ],
+          "half_extents": [
+            1.285,
+            2.707,
+            1.285
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            2.803,
+            32.294,
+            -2.939
+          ],
+          "half_extents": [
+            0.643,
+            0.334,
+            0.482
+          ]
+        },
+        {
+          "tag": "vent_pipe",
+          "center": [
+            -2.595,
+            32.822,
+            0.142
+          ],
+          "half_extents": [
+            0.361,
+            0.862,
+            0.361
+          ]
+        }
+      ],
+      "collider_count": 7,
+      "prop_count": 5,
+      "tris": 904
+    },
+    {
+      "name": "bld_tenement_02",
+      "kind": "tenement",
+      "mesh": "bld_tenement_02.glb",
+      "footprint_xz": [
+        16,
+        17
+      ],
+      "roof_y": 29.0,
+      "landing_decks_y": [
+        29.0
+      ],
+      "total_height_y": 32.6,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.5,
+            0.0
+          ],
+          "half_extents": [
+            8.0,
+            14.5,
+            8.5
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            0.159,
+            29.36,
+            -4.588
+          ],
+          "half_extents": [
+            0.695,
+            0.36,
+            0.52
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            4.889,
+            29.436,
+            5.376
+          ],
+          "half_extents": [
+            0.84,
+            0.436,
+            0.63
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            1.03,
+            29.338,
+            4.242
+          ],
+          "half_extents": [
+            0.651,
+            0.338,
+            0.488
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -2.335,
+            29.465,
+            2.807
+          ],
+          "half_extents": [
+            0.897,
+            0.466,
+            0.673
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            -3.923,
+            30.067,
+            -1.7
+          ],
+          "half_extents": [
+            1.21,
+            1.067,
+            1.012
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            4.233,
+            30.8,
+            -4.657
+          ],
+          "half_extents": [
+            0.101,
+            1.8,
+            0.101
+          ]
+        }
+      ],
+      "collider_count": 7,
+      "prop_count": 6,
+      "tris": 988
+    },
+    {
+      "name": "bld_deco_03",
+      "kind": "deco",
+      "mesh": "bld_deco_03.glb",
+      "footprint_xz": [
+        16,
+        19
+      ],
+      "roof_y": 29.2,
+      "landing_decks_y": [
+        29.2,
+        32.41
+      ],
+      "total_height_y": 38.24,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.6,
+            0.0
+          ],
+          "half_extents": [
+            8.0,
+            14.6,
+            9.5
+          ]
+        },
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            30.805,
+            0.0
+          ],
+          "half_extents": [
+            5.92,
+            1.605,
+            7.03
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            2.767,
+            31.32,
+            -3.763
+          ],
+          "half_extents": [
+            1.006,
+            2.12,
+            1.006
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -0.892,
+            31.987,
+            5.166
+          ],
+          "half_extents": [
+            1.323,
+            2.787,
+            1.323
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            1.372,
+            32.797,
+            2.682
+          ],
+          "half_extents": [
+            0.754,
+            0.392,
+            0.566
+          ]
+        }
+      ],
+      "collider_count": 5,
+      "prop_count": 3,
+      "tris": 908
+    },
+    {
+      "name": "bld_walkup_02",
+      "kind": "walkup",
+      "mesh": "bld_walkup_02.glb",
+      "footprint_xz": [
+        18,
+        20
+      ],
+      "roof_y": 29.4,
+      "landing_decks_y": [
+        29.4
+      ],
+      "total_height_y": 34.19,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.7,
+            0.0
+          ],
+          "half_extents": [
+            9.0,
+            14.7,
+            10.0
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            0.424,
+            30.884,
+            3.325
+          ],
+          "half_extents": [
+            0.084,
+            1.484,
+            0.084
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            -3.129,
+            31.067,
+            4.72
+          ],
+          "half_extents": [
+            0.094,
+            1.667,
+            0.094
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -0.044,
+            31.793,
+            -4.216
+          ],
+          "half_extents": [
+            1.137,
+            2.393,
+            1.137
+          ]
+        },
+        {
+          "tag": "vent_pipe",
+          "center": [
+            -6.088,
+            29.925,
+            -3.554
+          ],
+          "half_extents": [
+            0.221,
+            0.525,
+            0.221
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            -5.324,
+            30.489,
+            -7.051
+          ],
+          "half_extents": [
+            1.236,
+            1.089,
+            1.034
+          ]
+        }
+      ],
+      "collider_count": 6,
+      "prop_count": 5,
+      "tris": 1160
+    },
+    {
+      "name": "bld_glass_02",
+      "kind": "glass",
+      "mesh": "bld_glass_02.glb",
+      "footprint_xz": [
+        15,
+        18
+      ],
+      "roof_y": 29.8,
+      "landing_decks_y": [
+        29.8
+      ],
+      "total_height_y": 35.35,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            14.9,
+            0.0
+          ],
+          "half_extents": [
+            7.5,
+            14.9,
+            9.0
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            -2.829,
+            30.966,
+            2.77
+          ],
+          "half_extents": [
+            1.323,
+            1.167,
+            1.107
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            2.663,
+            32.111,
+            -2.014
+          ],
+          "half_extents": [
+            1.097,
+            2.311,
+            1.097
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -2.192,
+            30.265,
+            -5.187
+          ],
+          "half_extents": [
+            0.895,
+            0.465,
+            0.671
+          ]
+        },
+        {
+          "tag": "vent_pipe",
+          "center": [
+            2.478,
+            30.444,
+            2.776
+          ],
+          "half_extents": [
+            0.27,
+            0.644,
+            0.27
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            1.717,
+            32.576,
+            -5.433
+          ],
+          "half_extents": [
+            1.318,
+            2.776,
+            1.318
+          ]
+        }
+      ],
+      "collider_count": 6,
+      "prop_count": 5,
+      "tris": 808
+    },
+    {
+      "name": "bld_tenement_03",
+      "kind": "tenement",
+      "mesh": "bld_tenement_03.glb",
+      "footprint_xz": [
+        14,
+        18
+      ],
+      "roof_y": 30.0,
+      "landing_decks_y": [
+        30.0
+      ],
+      "total_height_y": 35.08,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            15.0,
+            0.0
+          ],
+          "half_extents": [
+            7.0,
+            15.0,
+            9.0
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -1.616,
+            32.539,
+            -0.269
+          ],
+          "half_extents": [
+            1.206,
+            2.539,
+            1.206
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -1.627,
+            32.495,
+            -4.819
+          ],
+          "half_extents": [
+            1.184,
+            2.494,
+            1.184
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            3.96,
+            30.459,
+            5.399
+          ],
+          "half_extents": [
+            0.886,
+            0.46,
+            0.664
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            2.768,
+            30.457,
+            -2.702
+          ],
+          "half_extents": [
+            0.88,
+            0.457,
+            0.66
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            -1.388,
+            31.567,
+            5.849
+          ],
+          "half_extents": [
+            0.088,
+            1.567,
+            0.088
+          ]
+        }
+      ],
+      "collider_count": 6,
+      "prop_count": 5,
+      "tris": 1272
+    },
+    {
+      "name": "bld_walkup_03",
+      "kind": "walkup",
+      "mesh": "bld_walkup_03.glb",
+      "footprint_xz": [
+        12,
+        15
+      ],
+      "roof_y": 30.6,
+      "landing_decks_y": [
+        30.6
+      ],
+      "total_height_y": 34.37,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            15.3,
+            0.0
+          ],
+          "half_extents": [
+            6.0,
+            15.3,
+            7.5
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            -1.534,
+            32.484,
+            -1.224
+          ],
+          "half_extents": [
+            0.106,
+            1.884,
+            0.106
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            2.437,
+            31.595,
+            0.6
+          ],
+          "half_extents": [
+            1.129,
+            0.995,
+            0.944
+          ]
+        }
+      ],
+      "collider_count": 3,
+      "prop_count": 2,
+      "tris": 892
+    },
+    {
+      "name": "bld_tenement_04",
+      "kind": "tenement",
+      "mesh": "bld_tenement_04.glb",
+      "footprint_xz": [
+        17,
+        17
+      ],
+      "roof_y": 31.0,
+      "landing_decks_y": [
+        31.0
+      ],
+      "total_height_y": 35.88,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            15.5,
+            0.0
+          ],
+          "half_extents": [
+            8.5,
+            15.5,
+            8.5
+          ]
+        },
+        {
+          "tag": "vent_pipe",
+          "center": [
+            -4.455,
+            31.775,
+            0.133
+          ],
+          "half_extents": [
+            0.325,
+            0.775,
+            0.325
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -1.062,
+            31.378,
+            2.895
+          ],
+          "half_extents": [
+            0.728,
+            0.378,
+            0.546
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            5.49,
+            31.474,
+            2.961
+          ],
+          "half_extents": [
+            0.912,
+            0.473,
+            0.684
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -5.565,
+            31.513,
+            5.017
+          ],
+          "half_extents": [
+            0.989,
+            0.513,
+            0.742
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -5.414,
+            31.341,
+            -4.008
+          ],
+          "half_extents": [
+            0.658,
+            0.342,
+            0.493
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -0.38,
+            33.438,
+            -2.202
+          ],
+          "half_extents": [
+            1.157,
+            2.438,
+            1.157
+          ]
+        }
+      ],
+      "collider_count": 7,
+      "prop_count": 6,
+      "tris": 1220
+    },
+    {
+      "name": "bld_glass_03",
+      "kind": "glass",
+      "mesh": "bld_glass_03.glb",
+      "footprint_xz": [
+        17,
+        17
+      ],
+      "roof_y": 31.2,
+      "landing_decks_y": [
+        31.2
+      ],
+      "total_height_y": 35.49,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            15.6,
+            0.0
+          ],
+          "half_extents": [
+            8.5,
+            15.6,
+            8.5
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            2.09,
+            31.548,
+            3.99
+          ],
+          "half_extents": [
+            0.671,
+            0.348,
+            0.503
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            2.722,
+            31.648,
+            0.487
+          ],
+          "half_extents": [
+            0.865,
+            0.449,
+            0.648
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            -2.831,
+            32.877,
+            -1.158
+          ],
+          "half_extents": [
+            0.095,
+            1.677,
+            0.095
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -1.443,
+            31.669,
+            2.828
+          ],
+          "half_extents": [
+            0.904,
+            0.469,
+            0.678
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -3.381,
+            31.631,
+            -5.501
+          ],
+          "half_extents": [
+            0.832,
+            0.431,
+            0.624
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            1.477,
+            33.347,
+            -4.093
+          ],
+          "half_extents": [
+            1.02,
+            2.147,
+            1.02
+          ]
+        }
+      ],
+      "collider_count": 7,
+      "prop_count": 6,
+      "tris": 824
+    },
+    {
+      "name": "bld_walkup_04",
+      "kind": "walkup",
+      "mesh": "bld_walkup_04.glb",
+      "footprint_xz": [
+        11,
+        13
+      ],
+      "roof_y": 31.4,
+      "landing_decks_y": [
+        31.4
+      ],
+      "total_height_y": 35.42,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            15.7,
+            0.0
+          ],
+          "half_extents": [
+            5.5,
+            15.7,
+            6.5
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            2.036,
+            32.335,
+            -3.334
+          ],
+          "half_extents": [
+            1.06,
+            0.935,
+            0.887
+          ]
+        },
+        {
+          "tag": "antenna",
+          "center": [
+            2.172,
+            33.408,
+            2.528
+          ],
+          "half_extents": [
+            0.113,
+            2.008,
+            0.113
+          ]
+        }
+      ],
+      "collider_count": 3,
+      "prop_count": 2,
+      "tris": 892
+    },
+    {
+      "name": "bld_glass_04",
+      "kind": "glass",
+      "mesh": "bld_glass_04.glb",
+      "footprint_xz": [
+        20,
+        19
+      ],
+      "roof_y": 31.8,
+      "landing_decks_y": [
+        31.8
+      ],
+      "total_height_y": 37.21,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            15.9,
+            0.0
+          ],
+          "half_extents": [
+            10.0,
+            15.9,
+            9.5
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -3.888,
+            33.99,
+            2.367
+          ],
+          "half_extents": [
+            1.04,
+            2.191,
+            1.04
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            2.762,
+            32.968,
+            -3.058
+          ],
+          "half_extents": [
+            1.325,
+            1.168,
+            1.109
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            -3.626,
+            32.799,
+            -4.239
+          ],
+          "half_extents": [
+            1.133,
+            0.999,
+            0.948
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            6.349,
+            34.504,
+            1.051
+          ],
+          "half_extents": [
+            1.284,
+            2.704,
+            1.284
+          ]
+        },
+        {
+          "tag": "bulkhead",
+          "center": [
+            -0.996,
+            32.907,
+            6.432
+          ],
+          "half_extents": [
+            1.256,
+            1.107,
+            1.051
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            0.09,
+            34.062,
+            2.69
+          ],
+          "half_extents": [
+            1.074,
+            2.262,
+            1.074
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -4.82,
+            32.247,
+            6.27
+          ],
+          "half_extents": [
+            0.862,
+            0.447,
+            0.646
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            7.136,
+            32.261,
+            4.646
+          ],
+          "half_extents": [
+            0.888,
+            0.461,
+            0.666
+          ]
+        }
+      ],
+      "collider_count": 9,
+      "prop_count": 8,
+      "tris": 1148
+    },
+    {
+      "name": "bld_tenement_05",
+      "kind": "tenement",
+      "mesh": "bld_tenement_05.glb",
+      "footprint_xz": [
+        20,
+        20
+      ],
+      "roof_y": 32.0,
+      "landing_decks_y": [
+        32.0
+      ],
+      "total_height_y": 37.23,
+      "colliders": [
+        {
+          "tag": "body",
+          "center": [
+            0.0,
+            16.0,
+            0.0
+          ],
+          "half_extents": [
+            10.0,
+            16.0,
+            10.0
+          ]
+        },
+        {
+          "tag": "vent_pipe",
+          "center": [
+            -6.749,
+            32.559,
+            -1.637
+          ],
+          "half_extents": [
+            0.234,
+            0.559,
+            0.234
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            3.095,
+            34.114,
+            2.134
+          ],
+          "half_extents": [
+            1.004,
+            2.114,
+            1.004
+          ]
+        },
+        {
+          "tag": "vent_pipe",
+          "center": [
+            2.089,
+            32.812,
+            -4.556
+          ],
+          "half_extents": [
+            0.341,
+            0.812,
+            0.341
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            7.095,
+            34.617,
+            4.115
+          ],
+          "half_extents": [
+            1.242,
+            2.618,
+            1.242
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -1.202,
+            34.599,
+            6.187
+          ],
+          "half_extents": [
+            1.234,
+            2.599,
+            1.234
+          ]
+        },
+        {
+          "tag": "ac_unit",
+          "center": [
+            -2.013,
+            32.502,
+            -5.918
+          ],
+          "half_extents": [
+            0.969,
+            0.502,
+            0.727
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            -2.407,
+            34.108,
+            1.966
+          ],
+          "half_extents": [
+            1.001,
+            2.108,
+            1.001
+          ]
+        },
+        {
+          "tag": "water_tower",
+          "center": [
+            5.3,
+            34.162,
+            -0.604
+          ],
+          "half_extents": [
+            1.026,
+            2.162,
+            1.026
+          ]
+        },
+        {
+          "tag": "vent_pipe",
+          "center": [
+            5.575,
+            32.778,
+            -4.24
+          ],
+          "half_extents": [
+            0.326,
+            0.778,
+            0.326
+          ]
+        }
+      ],
+      "collider_count": 10,
+      "prop_count": 9,
+      "tris": 1916
+    }
+  ],
+  "roof_band_y": {
+    "min": 28.0,
+    "max": 32.0,
+    "spread": 4.0
+  },
+  "totals": {
+    "buildings": 16,
+    "colliders": 98,
+    "prop_colliders": 79,
+    "tris": 16684
+  }
+}
