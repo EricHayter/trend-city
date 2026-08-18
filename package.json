@@ -1,0 +1,26 @@
+{
+  "name": "spark-borough",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "VOLTBOROUGH \u2014 a high-speed cel-shaded 3D action platformer in Three.js. Zero external assets.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173 --strictPort",
+    "typecheck": "tsc --noEmit",
+    "capture": "node harness/capture.mjs",
+    "capture:stills": "node harness/capture.mjs --set=stills",
+    "capture:motion": "node harness/capture.mjs --set=motion",
+    "capture:turntable": "node harness/capture.mjs --set=turntable"
+  },
+  "dependencies": {
+    "three": "^0.185.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.0",
+    "playwright": "^1.58.0",
+    "typescript": "^5.6.3",
+    "vite": "^7.1.5"
+  }
+}
