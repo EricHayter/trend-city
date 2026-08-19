@@ -1247,17 +1247,14 @@ function buildRubberParts(): BufferGeometry[] {
   // sole flat and horizontal — rather than along the ankle→toe bone vector.
   //
   // That distinction is the whole fix. The old shoe was lofted along the bone
-  // direction, which at rest ran 22° into the ground, so the sole was a tilted
-  // rocker whose lowest point sat 102 mm below the ankle and 46 mm in front of
-  // it. The ankle was 72 mm above the pedal spindle. The sole therefore passed
-  // 30 mm THROUGH the pedal, in front of it, at an angle — a shoe pointed at
-  // the dirt with nothing under it, on every frame of every sequence, while the
-  // ankle JOINT measured a perfect 72 mm from its anchor.
+  // direction, which at rest ran 22 degrees into the ground, so the sole was a
+  // tilted rocker whose lowest point sat 102 mm below the ankle and 46 mm in
+  // front of it — a shoe pointed at the dirt with nothing under it, on every
+  // frame of every sequence, while the ankle JOINT measured perfectly.
   //
-  // Now the sole is a flat plane at exactly `FOOT.soleDrop` below the ankle and
-  // `LIMB.ankleLift` puts the ankle exactly `FOOT.platform` above that plane's
-  // spindle, so the shoe stands ON the pedal by construction and there is no
-  // number left to get wrong.
+  // Now the sole is a flat plane at exactly `FOOT.soleDrop` below the ankle, and
+  // `LIMB.ankleLift` IS `FOOT.soleDrop`, so a planted ankle puts the sole on the
+  // surface by construction and there is no number left to get wrong.
   for (const side of [1, -1]) {
     const ankle = side > 0 ? P.ankleL : P.ankleR;
     const foot: BoneName = side > 0 ? 'footL' : 'footR';

@@ -1,17 +1,22 @@
 /**
- * Skeleton — the rider's bone hierarchy, built in code, in the bike's own space.
+ * Skeleton — the character's bone hierarchy, built in code.
  *
  * Three decisions here decide whether the rest of the rig is easy or impossible:
  *
- *  1. THE REST POSE IS THE RIDING POSE, NOT A T-POSE. Every bone is authored in
- *     a standing "attack" stance with the hands already on the grips and the
- *     feet already on the pedals. A T-pose bind would mean the very first frame
- *     asks the IK for a 90° correction on every limb, which is exactly where
- *     procedural rigs pop, and it would mean the skin weights are solved for a
- *     shape the character is never in. Authoring the bind pose ON the bike makes
- *     every runtime correction small, so the solver stays in its well-behaved
- *     region and the deltoids/knees deform through the range they were weighted
- *     for.
+ *  1. THE REST POSE IS THE RUNNING STANCE, NOT A T-POSE. Every bone is authored
+ *     in an athletic ready position: a 12 degree forward lean, knees carrying a
+ *     little bend, elbows already folded into the running carriage. A T-pose
+ *     bind would mean the very first frame asks the IK for a 90 degree
+ *     correction on every limb, which is exactly where procedural rigs pop, and
+ *     it would mean the skin weights are solved for a shape the character is
+ *     never in. This character spends essentially all of its life running, so
+ *     binding in a run-ready stance keeps every runtime correction small, the
+ *     solver stays in its well-behaved region, and the deltoids and knees
+ *     deform through the range they were weighted for.
+ *
+ *     (This file began life binding a BMX rider with its hands on the grips and
+ *     its feet on the pedals, for exactly the same reason. The principle
+ *     survived the pivot; the pose did not.)
  *
  *  2. EVERY BONE'S REST LOCAL ROTATION IS IDENTITY. Bone k's local offset from
  *     its parent is therefore the same vector in rig space and in the parent's
@@ -26,13 +31,14 @@
  *     the segment lengths, and the rig would snap by that amount on frame one.
  *     Solving them guarantees |shoulder→elbow| is exactly `upperArm` forever.
  *
- * Rig space is bike space: +Y up, +Z forward, +X to the LEFT, origin at
- * mid-wheelbase on the axle line. Ground sits at y = -wheelRadius.
+ * Rig space: +Y up, +Z forward, +X to the LEFT, origin ON THE GROUND between
+ * the feet. y = 0 is the ground plane, which means the rig node can be placed
+ * at `PlayerState.position` (which is the feet) with no offset — every offset
+ * that is not zero is an offset something eventually gets wrong.
  */
 
 import { Bone, Skeleton, Vector3 } from 'three';
 
-import { BIKE_GEOM } from '../bike/BikeModel';
 import { makeLimbState, makeTwoBoneResult, solveTwoBone } from './IK';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,31 +150,24 @@ const AIM_NAME: Partial<Record<BoneName, BoneName>> = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Segment lengths, metres. A 1.79 m rider, BMX build: short-ish torso, long
- * limbs, wide shoulders. These are the numbers the IK is parameterised by, so
- * changing one here changes the whole rig consistently.
- */
-/**
- * The foot, in its own rest frame: origin at the ankle joint, +Z toward the
- * toe, sole flat and horizontal.
+ * The foot, in its own rest frame: origin at the ankle joint, +Z toward the toe,
+ * sole flat and horizontal.
  *
  * These numbers are shared by the three places that MUST agree or the foot
- * leaves the pedal: the rest skeleton (which positions the ankle above the
- * spindle), the shoe mesh (which is lofted from them), and the pedal contact
- * the rig solves onto. They live here rather than in RiderMesh so there is
- * exactly one definition of where the bottom of the shoe is.
+ * sinks into the ground: the rest skeleton (which puts the ankle `soleDrop`
+ * above the floor), the shoe mesh (which is lofted from them), and the rig's
+ * foot planting (which solves the ankle onto a contact point). They live here
+ * rather than in RiderMesh so there is exactly one definition of where the
+ * bottom of the shoe is.
  *
  * The rest foot is LEVEL. `poseLegs` writes the foot bone's rig rotation as the
- * PEDAL's own rotation times the ankle-flex channel, so with flex at zero the
+ * GROUND's own rotation times the ankle-flex channel, so with flex at zero the
  * shoe renders exactly as authored — which means "as authored" has to be the
- * sole flat on the platform, not a foot pointed 22° at the ground, which is
- * what it used to be.
+ * sole flat on the surface.
  */
 export const FOOT = {
   /** Underside of the sole below the ankle joint. */
   soleDrop: 0.090,
-  /** Pedal platform top above the spindle. BikeModel: 12.5 mm body, 7.5 mm pins. */
-  platform: 0.010,
   /** Back of the heel, behind the ankle. */
   heelBack: 0.078,
   /** Tip of the toe, ahead of the ankle. `heelBack + toeAhead` = shoe length. */
@@ -186,29 +185,15 @@ export const LIMB = {
   thigh: 0.425,
   shin: 0.405,
   /**
-   * How far the ankle JOINT sits above the pedal spindle.
+   * How far the ankle JOINT sits above the ground when the foot is planted.
    *
-   * This is not a free parameter, and it was previously wrong by 28 mm in the
-   * wrong direction. The sole of the shoe is `FOOT.soleDrop` below the ankle
-   * and the pedal's platform surface is `FOOT.platform` above its spindle, so
-   * for the sole to sit ON the platform the ankle must be exactly the sum of
-   * the two above the spindle. At the old 0.072 the sole passed 30 mm THROUGH
-   * the pedal and out the bottom of it — which, together with `ankleBack`
-   * below, is the whole of "the shoe hangs clear of the crank, sole facing
-   * nothing". The foot-to-anchor distance measured 0.0727 m and was reported as
-   * correct, because the number being measured was the ankle JOINT, and nobody
-   * checked where the rendered sole was relative to it.
+   * This is not a free parameter: the sole of the shoe is `FOOT.soleDrop` below
+   * the ankle, so for the sole to sit ON the ground the ankle must be exactly
+   * that far above it. Getting this wrong by a couple of centimetres is the
+   * classic "character skates with its feet inside the terrain" bug, and it is
+   * invisible in a still taken from anywhere but ground level.
    */
-  ankleLift: FOOT.soleDrop + FOOT.platform,
-  /**
-   * How far the ankle sits BEHIND the spindle.
-   *
-   * A pedal spindle goes under the BALL of the foot, which on this rider is
-   * 78 mm forward of the ankle. The old value was 10 mm — the spindle
-   * effectively under the ankle bone — so the entire shoe hung out in front of
-   * the crank with nothing under it.
-   */
-  ankleBack: FOOT.ballAhead,
+  ankleLift: FOOT.soleDrop,
 };
 
 /** Radii and shape parameters the mesh builder needs. Metres. */
@@ -243,37 +228,24 @@ export const RIDER_DIMS = {
   clothGap: 0.016,
 };
 
-/** Where the grip centre sits in bike space, derived from the bar sweep. */
-const GRIP_INSET = 0.064;
-const GRIP_X = BIKE_GEOM.barHalfWidth - GRIP_INSET;
-export const GRIP_REST = {
-  x: GRIP_X,
-  y: BIKE_GEOM.barClamp.y + BIKE_GEOM.barRise + 0.002,
-  z: BIKE_GEOM.barClamp.z - GRIP_X * Math.sin(BIKE_GEOM.barBackSweep),
-};
-
-/** Cranks horizontal at rest: left pedal back, right pedal forward. */
-export const REST_CRANK_ANGLE = Math.PI * 0.5;
-
 /**
- * Pedal spindle position in bike space.
- * `side` is +1 for the LEFT pedal (+X), -1 for the right. At angle 0 the left
- * crank points straight down, matching BikeModel's crank authoring.
+ * The stance. Half the distance between the feet, and how far the planted foot
+ * sits ahead of the hip line.
+ *
+ * A runner's feet are not under their hips — they are inboard of them, which is
+ * why a run cycle reads as a run and not as a waddle. 0.098 matches the hip
+ * bone's own X so the rest legs are vertical in the frontal plane; the run
+ * cycle narrows it from there.
  */
-export function pedalPosition(side: number, angle: number, out: Vector3): Vector3 {
-  const L = BIKE_GEOM.crankLength;
-  const c = Math.cos(angle);
-  const s = Math.sin(angle);
-  return out.set(
-    BIKE_GEOM.bb.x + side * BIKE_GEOM.crankOffset,
-    BIKE_GEOM.bb.y - side * L * c,
-    BIKE_GEOM.bb.z - side * L * s,
-  );
-}
+export const STANCE = {
+  halfWidth: 0.098,
+  /** Rest ankle Z. Slightly ahead of the hips, matching the forward lean. */
+  footAhead: 0.010,
+} as const;
 
-/** Grip centre in bike space for a side (+1 = left). */
-export function gripPosition(side: number, out: Vector3): Vector3 {
-  return out.set(side * GRIP_REST.x, GRIP_REST.y, GRIP_REST.z);
+/** Rest ground contact for a foot in rig space. `side` is +1 for the LEFT. */
+export function footRest(side: number, out: Vector3): Vector3 {
+  return out.set(side * STANCE.halfWidth, LIMB.ankleLift, STANCE.footAhead);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -338,8 +310,11 @@ export interface RestTable {
   length: Float32Array;
   /** Rest bend directions for the four IK limbs. */
   bend: { armL: Vector3; armR: Vector3; legL: Vector3; legR: Vector3 };
-  /** Rest anchor positions the rig locks to. */
-  anchors: { gripL: Vector3; gripR: Vector3; pedalL: Vector3; pedalR: Vector3 };
+  /**
+   * Rest end-effector positions, so the rig has something to blend FROM and the
+   * mesh builder has the hand/foot centres without re-deriving them.
+   */
+  anchors: { handL: Vector3; handR: Vector3; footL: Vector3; footR: Vector3 };
 }
 
 export const REST: RestTable = buildRest();
@@ -350,62 +325,76 @@ function buildRest(): RestTable {
     pos[BONE_INDEX[name]] = p;
   };
 
-  // ── Spine: pelvis up through a forward-leaning torso ──────────────────────
-  set('pelvis', v(0, 0.780, -0.130));
-  set('spine1', v(0, 0.886, -0.041));
-  set('spine2', v(0, 0.993, 0.049));
-  set('chest', v(0, 1.113, 0.151));
-  set('neck', v(0, 1.214, 0.188));
-  set('head', v(0, 1.330, 0.216));
-  set('headEnd', v(0, 1.472, 0.249));
+  // ── Spine: hips up through a torso leaning ~12 degrees into the run ───────
+  //
+  // Every Y here is measured from the GROUND, not from the hips, because the
+  // ground is what the physics hands us. `headEnd` lands at 1.722, which is
+  // `HULL.height` (1.72) to within a millimetre — the capsule the collision
+  // uses and the body the camera sees are the same height on purpose.
+  set('pelvis', v(0, 0.930, -0.030));
+  set('spine1', v(0, 1.065, -0.002));
+  set('spine2', v(0, 1.202, 0.027));
+  set('chest', v(0, 1.355, 0.060));
+  set('neck', v(0, 1.460, 0.077));
+  set('head', v(0, 1.577, 0.088));
+  set('headEnd', v(0, 1.722, 0.088));
 
-  // ── Arms: shoulders to the grips ──────────────────────────────────────────
-  const gripL = new Vector3();
-  const gripR = new Vector3();
-  gripPosition(1, gripL);
-  gripPosition(-1, gripR);
+  // ── Arms: the running carriage ────────────────────────────────────────────
+  //
+  // Hands in front of the hips, inboard, at roughly navel height. Shoulder to
+  // hand is 0.328 m against a 0.550 m arm, a chord ratio of 0.60 — a firm 90ish
+  // degree elbow, which is where a sprinter's arms live and, conveniently, the
+  // middle of the two-bone solver's range. Bind here and no runtime arm pose is
+  // ever asking the solver for something near full extension or full fold.
+  set('clavL', v(0.050, 1.370, 0.052));
+  set('clavR', v(-0.050, 1.370, 0.052));
+  set('upperArmL', v(0.186, 1.342, 0.062));
+  set('upperArmR', v(-0.186, 1.342, 0.062));
 
-  set('clavL', v(0.050, 1.128, 0.142));
-  set('clavR', v(-0.050, 1.128, 0.142));
-  set('upperArmL', v(0.186, 1.099, 0.166));
-  set('upperArmR', v(-0.186, 1.099, 0.166));
-  set('handL', gripL.clone());
-  set('handR', gripR.clone());
-  // The hand tip runs outboard along the bar, so the glove has a direction to
-  // be swept along and the wrist has a twist reference.
-  const barOut = new Vector3(1, 0.010, -Math.sin(BIKE_GEOM.barBackSweep)).normalize();
-  set('handEndL', gripL.clone().addScaledVector(barOut, 0.058));
+  const handL = v(0.152, 1.040, 0.185);
+  const handR = v(-0.152, 1.040, 0.185);
+  set('handL', handL.clone());
+  set('handR', handR.clone());
+  // The hand tip continues along the forearm, so the glove has a direction to be
+  // swept along and the wrist has a twist reference.
+  const forearmAxisL = handL.clone().sub(pos[BONE_INDEX.upperArmL]).normalize();
+  set('handEndL', handL.clone().addScaledVector(forearmAxisL, 0.058));
   set(
     'handEndR',
-    gripR.clone().addScaledVector(barOut.clone().set(-barOut.x, barOut.y, barOut.z), 0.058),
+    handR
+      .clone()
+      .addScaledVector(_pole.set(-forearmAxisL.x, forearmAxisL.y, forearmAxisL.z), 0.058),
   );
 
   const bendArmL = new Vector3();
   const bendArmR = new Vector3();
   const elbowL = new Vector3();
   const elbowR = new Vector3();
-  solveRestLimb(pos[BONE_INDEX.upperArmL], gripL, ELBOW_POLE_L, LIMB.upperArm, LIMB.forearm, elbowL, bendArmL);
+  solveRestLimb(pos[BONE_INDEX.upperArmL], handL, ELBOW_POLE_L, LIMB.upperArm, LIMB.forearm, elbowL, bendArmL);
   _pole.set(-ELBOW_POLE_L.x, ELBOW_POLE_L.y, ELBOW_POLE_L.z);
-  solveRestLimb(pos[BONE_INDEX.upperArmR], gripR, _pole, LIMB.upperArm, LIMB.forearm, elbowR, bendArmR);
+  solveRestLimb(pos[BONE_INDEX.upperArmR], handR, _pole, LIMB.upperArm, LIMB.forearm, elbowR, bendArmR);
   set('forearmL', elbowL.clone());
   set('forearmR', elbowR.clone());
 
-  // ── Legs: hips to the pedals ──────────────────────────────────────────────
-  const pedalL = new Vector3();
-  const pedalR = new Vector3();
-  pedalPosition(1, REST_CRANK_ANGLE, pedalL);
-  pedalPosition(-1, REST_CRANK_ANGLE, pedalR);
+  // ── Legs: hips down to two planted feet ───────────────────────────────────
+  //
+  // Hip to ankle is 0.796 m against a 0.830 m leg: 96% extended, so the rest
+  // knee carries a few degrees of bend. Straight legs (100%) are the one place
+  // a two-bone solver genuinely degenerates — the bend plane becomes undefined
+  // and the knee snaps to whatever the pole vector says the instant weight
+  // shifts. Keeping 4% in reserve at bind time costs nothing visually and means
+  // the solver is never asked for the singular case.
+  const ankleL = new Vector3();
+  const ankleR = new Vector3();
+  footRest(1, ankleL);
+  footRest(-1, ankleR);
 
-  const ankleL = pedalL.clone().add(v(0, LIMB.ankleLift, -LIMB.ankleBack));
-  const ankleR = pedalR.clone().add(v(0, LIMB.ankleLift, -LIMB.ankleBack));
-
-  set('thighL', v(0.098, 0.775, -0.128));
-  set('thighR', v(-0.098, 0.775, -0.128));
+  set('thighL', v(0.098, 0.885, -0.024));
+  set('thighR', v(-0.098, 0.885, -0.024));
   set('footL', ankleL.clone());
   set('footR', ankleR.clone());
   // The toe bone is the metatarsal joint, not the tip of the shoe: it is the
-  // hinge the front of the foot flexes about, so it belongs over the ball —
-  // which is to say directly over the spindle.
+  // hinge the front of the foot flexes about, so it belongs over the ball.
   set('toeL', ankleL.clone().add(v(0, -FOOT.toeJointDrop, FOOT.toeJointAhead)));
   set('toeR', ankleR.clone().add(v(0, -FOOT.toeJointDrop, FOOT.toeJointAhead)));
 
@@ -421,9 +410,9 @@ function buildRest(): RestTable {
 
   // ── Cloth ─────────────────────────────────────────────────────────────────
   // One hem bone at the small of the back, one per short leg. These carry the
-  // follow-through; without them cloth is welded to the body and the rider
+  // follow-through; without them cloth is welded to the body and the character
   // reads as a plastic figurine.
-  set('hem', v(0, 0.858, -0.098));
+  set('hem', v(0, 1.000, -0.075));
   set('shortsL', pos[BONE_INDEX.thighL].clone().lerp(kneeL, 0.62));
   set('shortsR', pos[BONE_INDEX.thighR].clone().lerp(kneeR, 0.62));
 
@@ -440,9 +429,9 @@ function buildRest(): RestTable {
     parents[i] = parentName === null ? -1 : BONE_INDEX[parentName];
     // The root bone's "offset from its parent" is its rig-space position: its
     // parent is the rig node itself. Leaving it at the origin would bind the
-    // skeleton half a metre below the mesh, and the whole rider would then
-    // float above the bike by exactly the pelvis height the moment the rig
-    // posed itself — which is precisely what it did the first time this ran.
+    // skeleton a metre below the mesh, and the whole character would then sink
+    // by exactly the pelvis height the moment the rig posed itself — which is
+    // precisely what it did the first time this ran.
     offset[i] =
       parentName === null ? pos[i].clone() : pos[i].clone().sub(pos[BONE_INDEX[parentName]]);
   }
@@ -494,7 +483,7 @@ function buildRest(): RestTable {
     side,
     length,
     bend: { armL: bendArmL, armR: bendArmR, legL: bendLegL, legR: bendLegR },
-    anchors: { gripL: gripL.clone(), gripR: gripR.clone(), pedalL, pedalR },
+    anchors: { handL: handL.clone(), handR: handR.clone(), footL: ankleL.clone(), footR: ankleR.clone() },
   };
 }
 
@@ -508,9 +497,9 @@ export function restPos(name: BoneName): Vector3 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * One rider's bones. Geometry and the rest table are shared across every rider;
- * only the Bone objects and the Skeleton are per-instance, because those are
- * what animate.
+ * One character's bones. Geometry and the rest table are shared across every
+ * instance; only the Bone objects and the Skeleton are per-instance, because
+ * those are what animate.
  */
 export class RiderSkeleton {
   readonly bones: Bone[] = [];

@@ -107,6 +107,27 @@ export const RUN = {
   max: 74.0,
 
   /**
+   * Hard ceiling on ground speed, m/s. 275 display units.
+   *
+   * `max` is what the ACCELERATION will take you to. It is not a speed limit,
+   * because the whole game is a descent and `SLOPE.accelScale` is 1.0 — a steep
+   * gully is supposed to hand you speed you could not have run up to. This is
+   * the number that stops a 40-degree face from producing an unrenderable
+   * velocity, and nothing else should ever clamp to `max`.
+   */
+  hardMax: 110.0,
+
+  /**
+   * m/s². Decay applied to ground speed ABOVE `max`.
+   *
+   * Deliberately far gentler than `friction` (22). A dash ends at 88 m/s and
+   * `friction` would spend that back down to 74 in 0.64 s, which throws away
+   * the entire point of dashing on the flat. At 6.0 the dash's overspeed
+   * survives 2.3 s, long enough to be a routing decision.
+   */
+  overDecay: 6.0,
+
+  /**
    * The speed the low-gear acceleration hands over to the high-gear one.
    *
    * Spark 3's acceleration is not linear to top speed — it leaves the line
@@ -180,6 +201,22 @@ export const SLOPE = {
 
   /** Above this gradient (rad) the character cannot hold a standing start. */
   slipAngle: 0.86,
+
+  /**
+   * Minimum floor-normal Y the character can stand and run on. cos(58.7 deg).
+   *
+   * This is the single number that decides what the mountain IS. A platformer
+   * value (cos(45 deg) = 0.707) turns most of an eroded alpine heightfield into
+   * un-standable wall and the descent becomes a narrow corridor between cliffs.
+   * At 0.52 the character runs down almost anything the erosion produced, which
+   * is the requested game.
+   *
+   * Note the deliberate gap between this and `WALL.maxNormalY` (0.40): a face
+   * between 0.40 and 0.52 is too steep to run and not steep enough to wall run,
+   * so it is a scramble the character slides down. That band is a feature — it
+   * is what makes committing to a steep line a real risk.
+   */
+  walkableNormalY: 0.52,
 
   /**
    * Rate the visual and the collision hull slerp toward the floor normal,
