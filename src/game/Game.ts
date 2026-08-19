@@ -124,10 +124,11 @@ interface Situation {
    * 12 frames before shooting, which at these speeds is a long way, so a pose
    * that needs to cover ground on the run-in has to say so.
    *
-   * A word on scale. `RUN.max` is 74 m/s, so 120 steps — one second — covers
-   * 74 m. Prerolls here are consequently much SHORTER than the bike's were for
-   * the same distance, and a preroll tuned on the bike will overshoot the whole
-   * feature.
+   * A word on scale. `RUN.max` is 20 m/s, so 120 steps — one second — covers
+   * 20 m. These prerolls were multiplied by ~3.7 when the speed table was cut
+   * from 74 m/s (see the header of `SparkConstants.ts`): a slower character
+   * covers less ground per step and therefore needs LONGER to reach the same
+   * feature. A preroll carried over from the old scale stops short of it.
    */
   preroll?: number;
   camera: CameraMode;
@@ -147,36 +148,36 @@ interface Situation {
 // The ravine's actual hole is at 0.675–0.678.
 const SITUATIONS: Record<string, Situation> = {
   'summit-wide':        { t: 0.004, speed: 0,  camera: CameraMode.Orbit, orbit: { yaw: 0.35, pitch: 0.22, dist: 52, spin: 0 } },
-  'summit-rider':       { t: 0.020, speed: 6,  camera: CameraMode.Orbit, orbit: { yaw: 0.95, pitch: 0.18, dist: 9 } },
+  'summit-rider':       { t: 0.020, speed: 4,  camera: CameraMode.Orbit, orbit: { yaw: 0.95, pitch: 0.18, dist: 9 } },
   // Tight enough to read the face and the hands. The character is 1.8 m, so a
   // 3.4 m stand-off is a chest-up crop rather than the full figure.
-  'rider-closeup':      { t: 0.075, speed: 12, camera: CameraMode.Orbit, orbit: { yaw: 2.30, pitch: 0.10, dist: 3.4 } },
-  'rider-threequarter': { t: 0.075, speed: 12, camera: CameraMode.Orbit, orbit: { yaw: 0.95, pitch: 0.20, dist: 5.0 } },
+  'rider-closeup':      { t: 0.075, speed: 6, camera: CameraMode.Orbit, orbit: { yaw: 2.30, pitch: 0.10, dist: 3.4 } },
+  'rider-threequarter': { t: 0.075, speed: 6, camera: CameraMode.Orbit, orbit: { yaw: 0.95, pitch: 0.20, dist: 5.0 } },
   // Side-on and low, so the run cycle is a readable silhouette rather than a
   // three-quarter rear view half-occluded by the character's own leg. This is
   // the pose the locomotion rig is judged on.
-  'run-cycle':          { t: 0.075, speed: 22, camera: CameraMode.Orbit, orbit: { yaw: 1.57, pitch: 0.04, dist: 5.2 } },
-  'scree-speed':        { t: 0.189, speed: 44, camera: CameraMode.Chase, input: { moveZ: 1 } },
-  'switchback-lean':    { t: 0.394, speed: 34, camera: CameraMode.Chase, input: { moveX: 0.38, moveZ: 1 } },
-  'treeline-silhouette':{ t: 0.470, speed: 26, camera: CameraMode.Orbit, orbit: { yaw: 2.65, pitch: 0.06, dist: 16 } },
-  'rockgarden-low':     { t: 0.559, speed: 26, camera: CameraMode.Orbit, orbit: { yaw: 0.60, pitch: -0.08, dist: 6.5 } },
+  'run-cycle':          { t: 0.075, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 1.57, pitch: 0.04, dist: 5.2 } },
+  'scree-speed':        { t: 0.189, speed: 17, camera: CameraMode.Chase, input: { moveZ: 1 } },
+  'switchback-lean':    { t: 0.394, speed: 12, camera: CameraMode.Chase, input: { moveX: 0.38, moveZ: 1 } },
+  'treeline-silhouette':{ t: 0.470, speed: 12, camera: CameraMode.Orbit, orbit: { yaw: 2.65, pitch: 0.06, dist: 16 } },
+  'rockgarden-low':     { t: 0.559, speed: 12, camera: CameraMode.Orbit, orbit: { yaw: 0.60, pitch: -0.08, dist: 6.5 } },
   // Genuinely ballistic off the table, not parked in the air above it. Placed on
   // the run-in and run off the lip. No impulse.
-  'tabletop-air':       { t: 0.6100, speed: 40, preroll: 90, camera: CameraMode.Chase, input: { moveZ: 1 } },
+  'tabletop-air':       { t: 0.6100, speed: 18, preroll: 330, camera: CameraMode.Chase, input: { moveZ: 1 } },
   // Placed short of the hole (0.675) and launched, so the character is arcing
   // OVER the ravine rather than standing next to it.
-  'ravine-gap':         { t: 0.6690, speed: 46, preroll: 30, launch: 12, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.26, dist: 11 } },
-  'ridge-exposure':     { t: 0.757, speed: 32, camera: CameraMode.Orbit, orbit: { yaw: 0.20, pitch: 0.30, dist: 26 } },
-  streambed:            { t: 0.849, speed: 24, camera: CameraMode.Chase },
+  'ravine-gap':         { t: 0.6690, speed: 19, preroll: 110, launch: 12, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.26, dist: 11 } },
+  'ridge-exposure':     { t: 0.757, speed: 14, camera: CameraMode.Orbit, orbit: { yaw: 0.20, pitch: 0.30, dist: 26 } },
+  streambed:            { t: 0.849, speed: 11, camera: CameraMode.Chase },
   // A slide down a gradient: the hull drops, the dust rate changes, and the
   // camera sits low enough to see both.
-  slide:                { t: 0.230, speed: 40, camera: CameraMode.Chase, input: { moveZ: 1, crouch: true } },
+  slide:                { t: 0.230, speed: 17, camera: CameraMode.Chase, input: { moveZ: 1, crouch: true } },
   // Short of the line, so the goal is ahead of the character and in frame.
-  'finish-sprint':      { t: 0.955, speed: 52, camera: CameraMode.Chase, input: { moveZ: 1 } },
+  'finish-sprint':      { t: 0.955, speed: 19, camera: CameraMode.Chase, input: { moveZ: 1 } },
   // Was `crash`. The name is kept because the capture harness's default pose
   // list uses it, and because it is still the pose that reviews impact
   // punctuation — it is now a scripted hit rather than a bike going down.
-  crash:                { t: 0.559, speed: 34, camera: CameraMode.Orbit, orbit: { yaw: 1.25, pitch: 0.18, dist: 8 }, hurt: true },
+  crash:                { t: 0.559, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 1.25, pitch: 0.18, dist: 8 }, hurt: true },
   'valley-vista':       { t: 0.300, speed: 0,  camera: CameraMode.Orbit, orbit: { yaw: 0.0, pitch: 0.06, dist: 180, spin: 0 } },
 };
 
@@ -202,17 +203,17 @@ const SEQUENCES: Record<string, { from: string; input?: Partial<PlayerInput>; pr
   // fall down the side of it. The sequence is meant to show a switchback being
   // carved, not a departure.
   switchback:     { from: 'switchback-lean', input: { moveX: 0.35, moveZ: 1 } },
-  'tabletop-air': { from: 'tabletop-air', preroll: 84, input: { moveZ: 1 } },
+  'tabletop-air': { from: 'tabletop-air', preroll: 310, input: { moveZ: 1 } },
   // Starts later on the same run-in so the whole capture is the descent, the
   // touchdown and the absorption chain that follows it.
-  landing:        { from: 'tabletop-air', preroll: 128, input: { moveZ: 1 } },
+  landing:        { from: 'tabletop-air', preroll: 470, input: { moveZ: 1 } },
   crash:          { from: 'crash' },
   'scree-speed':  { from: 'scree-speed', input: { moveZ: 1 } },
   // The air dash. `dash` is a PULSE — see `setScripted` — so it fires on the
   // first step of the sequence and then the coast is what gets photographed,
   // which is the whole point: a dash held every step would re-fire until the
   // air charges ran out and the capture would be of the charge budget emptying.
-  'air-dash':     { from: 'tabletop-air', preroll: 96, input: { moveZ: 1, dash: true } },
+  'air-dash':     { from: 'tabletop-air', preroll: 355, input: { moveZ: 1, dash: true } },
   slide:          { from: 'slide', input: { moveZ: 1, crouch: true } },
 };
 
@@ -771,8 +772,15 @@ export class Game {
   }
 }
 
-/** m/s averaged over the descent, for the capture clock estimate. */
-const NOMINAL_PACE = 38;
+/**
+ * m/s averaged over the descent, for the capture clock estimate.
+ *
+ * Kept equal to `StageDirector`'s `PAR_PACE`. The two answer the same question —
+ * "how long should being HERE have taken?" — and a capture whose clock disagrees
+ * with the stage's own par is a frame whose HUD contradicts itself, which is a
+ * defect a reviewer will report and be right about.
+ */
+const NOMINAL_PACE = 13;
 
 /**
  * Yaw from a forward vector, matching `PlayerState.facing`'s convention.

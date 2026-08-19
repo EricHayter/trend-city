@@ -68,17 +68,23 @@ const ROUTE_PROFILE_SAMPLES = 256;
 /**
  * The pace a competent run averages over the whole descent, m/s.
  *
- * Not `RUN.max`. 74 m/s is the ceiling on a straight, and the course is not a
+ * Not `RUN.max`. 20 m/s is the ceiling on a straight, and the course is not a
  * straight — the switchbacks, the rock garden and the technical start are all
  * places where the run is about carrying speed through a shape rather than
- * holding the ceiling. 30 m/s is 75 display units, a bit over 40% of the
- * ceiling, and it is what a run that lands its wall-runs and holds its rails
- * comes out at once the slow sections are averaged back in.
+ * holding the ceiling. 13 m/s is 33 display units, about 65% of the ceiling, and
+ * it is what a run that lands its wall-runs and holds its rails comes out at
+ * once the slow sections are averaged back in.
+ *
+ * WAS 30, against the old 74 m/s ceiling. That produced a 27 s par and a 67 s
+ * limit for a course a player crossed in 10.8 s, so the clock was never a
+ * factor in anything. On an 800 m route this gives a 62 s par and a 154 s
+ * limit against a ~40 s flat-out crossing — the fail-safe the block below
+ * describes, rather than a formality.
  *
  * Everything time-shaped in this file is expressed as a multiple of the par
  * time this produces, so the numbers survive the course changing length.
  */
-const PAR_PACE = 30.0;
+const PAR_PACE = 13.0;
 
 /**
  * The stage clock, as a multiple of par.

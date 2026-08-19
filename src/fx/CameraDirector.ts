@@ -241,7 +241,15 @@ export const CAMERA_TUNING = {
   /** Retained for source compatibility. Nothing reads it. */
   fovExponent: 2.7,
   /** Speed treated as "flat out", m/s. */
-  referenceSpeed: 26,
+  // 20, not 26. Every speed-shaped term in this file is `speed /
+  // referenceSpeed` clamped to 1 — the FOV curve, the dolly standoff and the
+  // lens buffet — so this value IS the top of the camera's dynamic range. At 26
+  // against a 74 m/s character all three clamped at 1.0 from 26 m/s upward:
+  // maximum lens, maximum standoff and maximum buffet held flat out for 65% of
+  // the speed range, with nothing left to express. A camera pinned at full
+  // amplitude reads as broken rather than as fast. Set to `RUN.max` so the top
+  // of the camera's range is the top of the character's.
+  referenceSpeed: 20,
 
   /**
    * THE FRAMING CONSTANT. Standoff × tan(halfFov), metres.
@@ -385,7 +393,13 @@ export const CAMERA_TUNING = {
    * of change per frame at 60 Hz. Present, and nowhere near a rattle: the
    * landing shake is ten times it.
    */
-  buffetDegrees: 0.82,
+  // 0.34, not 0.82. The buffet is a LENS WOBBLE and it was authored against a
+  // ramp that never got past its own onset — see `referenceSpeed`. With the
+  // ramp fixed the term is genuinely live across the speed range for the first
+  // time, and 0.82 degrees of continuous angular shake at cruising speed is the
+  // single biggest contributor to the game reading as unsmooth. This is a
+  // punctuation mark on a fast run, not a texture over the whole game.
+  buffetDegrees: 0.34,
   /** Pitch and roll as fractions of the yaw amplitude. Yaw dominates. */
   buffetPitchFrac: 0.72,
   buffetRollFrac: 0.55,
@@ -397,8 +411,11 @@ export const CAMERA_TUNING = {
    * monitor. Measured: dropping it from 0.085 to 0.045 cost about 0.4 of
    * whole-frame delta on `scree-speed`, all of it in the near-ground band.
    */
-  buffetMetres: 0.078,
-  buffetFrom: 0.45,
+  buffetMetres: 0.040,
+  // 0.62, not 0.45. Where the buffet starts, as a fraction of
+  // `referenceSpeed`. Pushed up so the bottom two thirds of the speed range are
+  // completely still: the effect has to be ABSENT somewhere to read as arriving.
+  buffetFrom: 0.62,
   /**
    * Buffet noise rates, features per second at the BOTTOM of the buffet's
    * range. Deliberately in the 4-7 Hz band and not lower: a 2 Hz wobble of the

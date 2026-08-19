@@ -376,10 +376,28 @@ export class PlayerPhysics {
     if (wishMag > 0.02) {
       if (wishMag > 1) wishMag = 1;
       // Screen-space: +moveZ is "away from camera", +moveX is "right".
+      //
+      // THE SIGN ON THE moveX TERMS IS NOT FREE, and it was wrong: left and
+      // right were swapped, so pressing D steered the character left.
+      //
+      // Derivation, because guessing this is a coin flip. `cameraYaw` maps to a
+      // forward vector the same way `facing` does — f = (sin y, 0, cos y). A
+      // three.js camera looks down its own LOCAL -Z, so its local +X (screen
+      // right) is cross(f, up), not cross(up, f):
+      //
+      //     right = cross((sin y, 0, cos y), (0, 1, 0)) = (-cos y, 0, sin y)
+      //
+      // Sanity check against the default camera, which looks along -Z and has
+      // right = +X: f = (0,0,-1) gives cross(f, up) = (1, 0, 0). Correct.
+      //
+      // The world wish is then moveZ * f + moveX * right, which is what these
+      // two lines are. The previous version used +moveX * cy and -moveX * sy —
+      // the X axis mirrored, i.e. cross(up, f) — and was self-consistent enough
+      // that nothing type-checked or crashed; it just drove the wrong way.
       const cy = Math.cos(input.cameraYaw);
       const sy = Math.sin(input.cameraYaw);
-      const wx = input.moveX * cy + input.moveZ * sy;
-      const wz = -input.moveX * sy + input.moveZ * cy;
+      const wx = input.moveZ * sy - input.moveX * cy;
+      const wz = input.moveZ * cy + input.moveX * sy;
       wishYaw = Math.atan2(wx, wz);
     } else {
       wishMag = 0;

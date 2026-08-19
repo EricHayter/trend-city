@@ -130,9 +130,14 @@ export const SPEED_TUNING = {
    * straight and a switchback were indistinguishable without reading the
    * speedo. The effect has to live where the speed lives.
    */
-  lineFloor: 8.0,
+  // 6 / 19 rather than 8 / 24. These bracket the speed range the rays ramp
+  // across, and against a 74 m/s character the old pair saturated at 24 m/s —
+  // so the frame was a solid white wall from a third of top speed upward, for
+  // the whole rest of the run. The ceiling now sits just under `RUN.max` (20),
+  // which is what makes flat out look different from quick.
+  lineFloor: 6.0,
   /** Full-strength reference speed, m/s. */
-  lineCeiling: 24.0,
+  lineCeiling: 19.0,
   /**
    * Exponent on the normalised speed.
    *
@@ -158,7 +163,10 @@ export const SPEED_TUNING = {
   // range, but at the old 0.78 ceiling they wash over the riders and flatten
   // the frame. The effect has to sit BEHIND the subject in the read, not on
   // top of it.
-  lineMax: 0.56,
+  // 0.42, not 0.56. Now that the ramp resolves across the real speed range
+  // instead of clamping, the peak is reached often rather than never, and the
+  // old peak was authored on the assumption it effectively never arrived.
+  lineMax: 0.42,
   /** Extra intensity contributed by an active boost. */
   boostBonus: 0.55,
   /** Metres ahead of the rider the focus point sits. */
@@ -1315,7 +1323,11 @@ export class SpeedFX {
       // above almost every speed the course is actually ridden at, so the
       // geometry smear — the one that streaks a limb during a trick — was
       // effectively dead code outside a full-tuck sprint.
-      const fromSpeed = clamp01((state.speed - 15) / 9) * 0.68;
+      // Onset at 11 m/s, full by 17. These were 15 and 24 — authored for a
+      // character whose ceiling was 74, which after the rescale sits at and
+      // above the new top speed of 20, so the geometry smear would have been
+      // dead code for almost the entire speed range.
+      const fromSpeed = clamp01((state.speed - 11) / 6) * 0.68;
       const fromSpin = whipping ? clamp01((spin - 4.2) / 6.5) * 0.9 : 0;
       const amount = Math.max(fromSpeed, fromSpin);
       if (amount > 0.02) {
