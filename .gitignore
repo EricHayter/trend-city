@@ -1,38 +1,5 @@
-# dependencies
-node_modules/
-.pnp
-.pnp.js
-
-# build output
-dist/
-dist-ssr/
-build/
-*.local
-
-# env
-.env
-.env.local
-.env.*.local
-
-# logs
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# editors
-.vscode/*
-!.vscode/extensions.json
-.idea/
-*.swp
-*.swo
-
-# os
+node_modules
+dist
+shots
 .DS_Store
-Thumbs.db
-
-# blender working files (source .blend, not the exported .glb in public/models)
-*.blend1
-*.blend2
+*.log

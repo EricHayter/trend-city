@@ -1,121 +1,303 @@
-// SCREENSHOT / MOTION HARNESS
-// Drives the real game in a real browser: selects a deterministic seed, injects input
-// through window.__input, captures retina stills, multi-angle turntables of the player,
-// enemies and boss, and deterministic frame sequences for motion review.
-//   node harness/capture.mjs --set=stills|motion|turntable|all [--url=http://127.0.0.1:5173]
+/**
+ * TREND CITY capture harness.
+ *
+ * Drives the real game in Chromium with deterministic input and a fixed
+ * timestep, then captures stills, motion sequences, multi-angle turntables and
+ * performance traces. Every visual claim in this project is checked against
+ * output from this script.
+ *
+ *   node harness/capture.mjs --set=stills
+ *   node harness/capture.mjs --set=motion --seed=ABC
+ *   node harness/capture.mjs --set=turntable
+ *   node harness/capture.mjs --set=perf
+ *   node harness/capture.mjs --set=all
+ *
+ * Flags: --seed --w --h --dpr --out --url --headed --keep
+ */
 import { chromium } from 'playwright';
-import { mkdirSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { mkdir, writeFile, rm, readdir, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 
-const args = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')));
-const URL = args.url || 'http://127.0.0.1:5173/';
-const SET = args.set || 'all';
-const OUT = args.out || 'captures';
-mkdirSync(OUT, { recursive: true });
+const args = Object.fromEntries(
+  process.argv.slice(2).map((a) => {
+    const m = a.match(/^--([^=]+)(?:=(.*))?$/);
+    return m ? [m[1], m[2] ?? true] : [a, true];
+  }),
+);
 
-const browser = await chromium.launch({
-  args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--no-sandbox'],
-});
-const page = await browser.newPage({ viewport: { width: 960, height: 540 }, deviceScaleFactor: 2 });
-page.on('console', (m) => console.log('[page]', m.text()));
-page.on('pageerror', (e) => console.log('[error]', e.message));
-await page.goto(URL, { waitUntil: 'load' });
-await page.waitForFunction(() => !!window.__game, null, { timeout: 30000 });
+const SET = args.set ?? 'stills';
+const SEED = args.seed ?? 'TREND-CITY';
+const W = +(args.w ?? 1280);
+const H = +(args.h ?? 720);
+const DPR = +(args.dpr ?? 2);
+const OUT = path.resolve(args.out ?? 'shots');
+const URL = args.url ?? 'http://127.0.0.1:5173';
+const FPS = 60;
 
-const shot = async (name) => { await page.screenshot({ path: `${OUT}/${name}.png` }); console.log('captured', name); };
-const hold = async (keys, ms) => {
-  await page.evaluate((k) => window.__input.set(k), keys);
-  await page.waitForTimeout(ms);
-};
-const release = () => page.evaluate(() => window.__input.set({ moveX: 0, moveY: 0, jump: false, dash: false, attack: false, boost: false, slide: false }));
-const tap = async (a) => { await page.evaluate((x) => window.__input.tap(x), a); await page.waitForTimeout(60); };
+// ───────────────────────────────────────────────────────── dev server
 
-// Deterministic entry: title -> intro -> select -> play on a fixed seed.
-const enterStage = async (seed = 'VOLT-CORE-001') => {
-  await page.evaluate((s) => {
-    const g = window.__game;
-    g.buildStage(s);
-    g.screen = 'play';
-    g.cam.snapTo(g.player);
-  }, seed);
-  await page.waitForTimeout(700);
-};
-
-if (SET === 'stills' || SET === 'all') {
-  await shot('01-title');
-  await page.evaluate(() => { window.__game.screen = 'intro'; });
-  await page.waitForTimeout(600); await shot('02-character-intro');
-  await page.evaluate(() => { const g = window.__game; g.screen = 'select'; g.prepareCards ? g.prepareCards() : null; });
-  await page.waitForTimeout(600); await shot('03-stage-select');
-  await enterStage();
-  await shot('04-idle');
-  await hold({ moveY: 1 }, 1400); await shot('05-running');
-  await hold({ moveY: 1, boost: true }, 1800); await shot('06-high-speed-boost');
-  await tap('jump'); await page.waitForTimeout(180); await shot('07-jump');
-  await tap('jump'); await page.waitForTimeout(150); await shot('08-double-jump');
-  await tap('dash'); await page.waitForTimeout(120); await shot('09-air-dash');
-  await release(); await page.waitForTimeout(900);
-  await hold({ moveY: 1 }, 900); await tap('attack'); await page.waitForTimeout(90); await shot('10-combat');
-  await hold({ moveY: 1, slide: true }, 300); await shot('11-slide');
-  await release();
-  await page.evaluate(() => { const g = window.__game; g.goalReached = true; g.player.spawn(g.stage.bossCenter.clone().setY(g.stage.bossCenter.y - 14), 0); });
-  await page.waitForTimeout(1600); await shot('12-boss');
-  await page.evaluate(() => window.__game.finish(true));
-  await page.waitForTimeout(900); await shot('13-results');
+async function reachable(url, ms = 900) {
+  try {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), ms);
+    const r = await fetch(url, { signal: c.signal });
+    clearTimeout(t);
+    return r.ok;
+  } catch { return false; }
 }
 
-if (SET === 'turntable' || SET === 'all') {
-  // Multi-angle inspection: the camera is placed deterministically around the subject so
-  // silhouettes, undersides and outline quality can be compared after every fix.
-  await enterStage();
-  const angles = [
-    ['front', 0, 1.6, 0], ['rear', Math.PI, 1.6, 0], ['left', -Math.PI / 2, 1.6, 0],
-    ['right', Math.PI / 2, 1.6, 0], ['top', 0.4, 7.5, -0.9], ['low', 0.9, 0.4, 0.45],
-    ['close', 2.2, 1.5, 0], ['far', 5.4, 3.0, 0.1],
-  ];
-  for (const [name, yaw, height, pitch] of angles) {
-    await page.evaluate(({ yaw, height, pitch, name }) => {
-      const g = window.__game;
-      const p = g.player.pos;
-      const r = name === 'close' ? 3.2 : name === 'far' ? 26 : 6.5;
-      g.cam.camera.position.set(p.x + Math.sin(yaw) * r, p.y + height, p.z + Math.cos(yaw) * r);
-      g.cam.camera.up.set(0, 1, 0);
-      g.cam.camera.lookAt(p.x, p.y + 1.1 + pitch, p.z);
-      g.screen = 'paused';
-    }, { yaw, height, pitch, name });
-    await page.waitForTimeout(180);
-    await shot('turntable-player-' + name);
+let child = null;
+async function ensureServer() {
+  if (await reachable(URL)) { console.log('· dev server already up'); return; }
+  console.log('· starting vite…');
+  child = spawn('npx', ['vite', '--host', '127.0.0.1', '--port', '5173'], {
+    stdio: ['ignore', 'pipe', 'pipe'], detached: false,
+  });
+  child.stdout.on('data', () => {});
+  child.stderr.on('data', (d) => process.stderr.write('[vite] ' + d));
+  for (let i = 0; i < 90; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    if (await reachable(URL)) { console.log('· vite ready'); return; }
   }
+  throw new Error('vite did not come up');
 }
 
-if (SET === 'motion' || SET === 'all') {
-  // Frame sequences: stills cannot show whether movement reads as fast and weighty.
-  await enterStage();
-  const seq = async (label, keys, frames, gap = 60) => {
-    await page.evaluate((k) => window.__input.set(k), keys);
-    for (let i = 0; i < frames; i++) { await page.waitForTimeout(gap); await shot(`motion-${label}-${String(i).padStart(2, '0')}`); }
-    await release();
-  };
-  await seq('sprint', { moveY: 1, dash: false }, 8);
-  await seq('boost', { moveY: 1, boost: true }, 8);
-  await page.evaluate(() => window.__input.tap('jump'));
-  await seq('air', { moveY: 1 }, 8);
-  await seq('attack', { moveY: 1, attack: true }, 6);
+// ───────────────────────────────────────────────────────── page control
+
+async function openPage(browser, { seed = SEED, w = W, h = H, dpr = DPR } = {}) {
+  const ctx = await browser.newContext({
+    viewport: { width: w, height: h },
+    deviceScaleFactor: dpr,
+    reducedMotion: 'no-preference',
+  });
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('console', (m) => {
+    if (m.type() === 'error') { errors.push(m.text()); console.log('  [console] ' + m.text()); }
+  });
+  page.on('pageerror', (e) => { errors.push(String(e)); console.log('  [pageerror] ' + e.message); });
+  page.__errors = errors;
+
+  await page.goto(`${URL}/?seed=${encodeURIComponent(seed)}&manual&deterministic`, { waitUntil: 'load' });
+  await page.waitForFunction('window.__ready === true', null, { timeout: 30000 });
+  // one warm frame so every shader compiles before we time anything
+  await page.evaluate(() => {
+    window.__t = 1000;
+    window.__game.clock.reset(window.__t);
+    window.__game.step(window.__t);
+  });
+  await page.waitForTimeout(400);
+  return page;
 }
 
-console.log(await page.evaluate(() => {
-  const g = window.__game;
-  return {
-    seed: g.stage.seed,
-    modules: g.stage.plan.length,
-    distance: g.stage.totalDistance,
-    solids: g.stage.data.physics.solids.length,
-    rails: g.stage.data.physics.rails.length,
-    pickups: g.stage.pickupTotal,
-    enemies: g.stage.enemyTotal,
-    drawCalls: g.pipeline.renderer.info.render.calls,
-    triangles: g.pipeline.renderer.info.render.triangles,
-    activeChunks: g.stage.streamer.activeCount,
-    validation: g.stage.report,
-  };
-}));
-await browser.close();
+/**
+ * Advance N frames at a fixed timestep with a deterministic input timeline.
+ * timeline entries: [fromFrame, [actions], {x,y}]
+ */
+async function advance(page, frames, timeline = []) {
+  await page.evaluate(async ({ frames, timeline, fps }) => {
+    const g = window.__game;
+    const dt = 1000 / fps;
+    let ti = 0;
+    for (let f = 0; f < frames; f++) {
+      while (ti < timeline.length && timeline[ti][0] <= f) {
+        const [, acts, axis] = timeline[ti];
+        g.input.setVirtual(acts ?? [], axis ?? undefined);
+        ti++;
+      }
+      window.__t += dt;
+      g.step(window.__t);
+      await new Promise((r) => requestAnimationFrame(r));
+    }
+  }, { frames, timeline, fps: FPS });
+}
+
+async function shot(page, dir, name) {
+  await mkdir(dir, { recursive: true });
+  const p = path.join(dir, name + '.png');
+  await page.screenshot({ path: p, animations: 'disabled' });
+  console.log('  ✓ ' + path.relative(process.cwd(), p));
+  return p;
+}
+
+async function setCam(page, px, py, pz, tx, ty, tz, fov) {
+  await page.evaluate(([a, b, c, d, e, f, g2]) => {
+    window.__game.setCamera(a, b, c, d, e, f, g2 ?? undefined);
+    window.__game.step(window.__t += 1000 / 60);
+  }, [px, py, pz, tx, ty, tz, fov ?? null]);
+  await page.waitForTimeout(60);
+}
+
+/** Builds a contact sheet from captured PNGs using the browser itself. */
+async function contactSheet(browser, files, outPath, cols = 4, label = '') {
+  if (!files.length) return;
+  const ctx = await browser.newContext({ deviceScaleFactor: 1 });
+  const page = await ctx.newPage();
+  const rows = Math.ceil(files.length / cols);
+  const cw = 480, ch = Math.round(cw * H / W);
+  await page.setViewportSize({ width: cols * cw, height: rows * ch + 34 });
+  // file:// sources do not load inside a setContent page, so inline the PNGs.
+  const imgs = (await Promise.all(files.map(async (f, i) => {
+    const b64 = (await readFile(f)).toString('base64');
+    return `<div class="c"><img src="data:image/png;base64,${b64}"><span>${i}&nbsp;${path.basename(f, '.png')}</span></div>`;
+  }))).join('');
+  await page.setContent(`<style>
+    body{margin:0;background:#0a0713;font:11px ui-monospace,monospace;color:#35e8ff}
+    h1{margin:0;padding:8px 10px;font-size:13px;letter-spacing:.14em;color:#ff2e6e}
+    .g{display:grid;grid-template-columns:repeat(${cols},${cw}px)}
+    .c{position:relative}.c img{width:${cw}px;height:${ch}px;display:block}
+    .c span{position:absolute;left:4px;top:4px;background:#0a0713cc;padding:1px 5px}
+  </style><h1>${label}</h1><div class="g">${imgs}</div>`);
+  await page.waitForTimeout(700);
+  await page.screenshot({ path: outPath, fullPage: true });
+  await ctx.close();
+  console.log('  ✓ SHEET ' + path.relative(process.cwd(), outPath));
+}
+
+// ───────────────────────────────────────────────────────── sets
+
+const HOLD_FWD = [[0, [], { x: 0, y: 1 }]];
+
+async function setStills(browser) {
+  const dir = path.join(OUT, 'stills');
+  const page = await openPage(browser);
+  const files = [];
+
+  // The gameplay camera, on the deck, looking down the route. This is the shot
+  // that has to work as a standalone clip frame.
+  await advance(page, 8);
+  files.push(await shot(page, dir, '01-route-forward'));
+
+  await setCam(page, 26, 24, 40, 0, 9, 120);
+  files.push(await shot(page, dir, '02-highway-sweep'));
+
+  await setCam(page, -120, 60, 200, 0, 20, 240);
+  files.push(await shot(page, dir, '03-skyline-wide'));
+
+  await setCam(page, 6, 11, 180, 6, 11, 320, 78);
+  files.push(await shot(page, dir, '04-low-speed-fov'));
+
+  await setCam(page, 40, 150, -60, 0, 0, 300);
+  files.push(await shot(page, dir, '05-elevated'));
+
+  await setCam(page, 0, -20, 60, 0, 30, 200);
+  files.push(await shot(page, dir, '06-underside'));
+
+  await setCam(page, -240, 90, 900, -330, 60, 620, 50);
+  files.push(await shot(page, dir, '07-landmark'));
+
+  await setCam(page, 3, 9.6, 240, 3, 10.4, 260, 40);
+  files.push(await shot(page, dir, '08-surface-closeup'));
+
+  await setCam(page, 90, 30, 470, 0, 14, 430);
+  files.push(await shot(page, dir, '09-ramp-rail'));
+
+  await setCam(page, 0, 420, 500, 0, 0, 500);
+  files.push(await shot(page, dir, '10-topdown'));
+
+  await contactSheet(browser, files, path.join(OUT, 'sheet-stills.png'), 4, `STILLS · seed ${SEED}`);
+  await page.context().close();
+  return files;
+}
+
+async function setMotion(browser) {
+  const dir = path.join(OUT, 'motion');
+  if (existsSync(dir) && !args.keep) await rm(dir, { recursive: true, force: true });
+  const page = await openPage(browser);
+  const files = [];
+  // forward run down the deck, sampled every 10 frames over 2 seconds
+  for (let k = 0; k < 12; k++) {
+    await advance(page, 10, k === 0 ? HOLD_FWD : []);
+    files.push(await shot(page, dir, `run-${String(k).padStart(2, '0')}`));
+  }
+  await contactSheet(browser, files, path.join(OUT, 'sheet-motion-run.png'), 4, `MOTION run · seed ${SEED}`);
+  await page.context().close();
+  return files;
+}
+
+/**
+ * Orbits a fixed world point and captures a full ring plus high and low angles.
+ * Any geometry that only looks right from one direction fails here.
+ */
+async function setTurntable(browser) {
+  const page = await openPage(browser);
+  const targets = [
+    { name: 'deck-join', at: [0, 10, 120], r: 34, h: 10 },
+    { name: 'wallrun-slab', at: [30, 14, 200], r: 40, h: 14 },
+    { name: 'tower', at: [70, 20, 300], r: 90, h: 40 },
+    { name: 'rail-arc', at: [0, 22, 220], r: 46, h: 16 },
+  ];
+  const all = [];
+  for (const t of targets) {
+    const dir = path.join(OUT, 'turntable', t.name);
+    const files = [];
+    for (let a = 0; a < 8; a++) {
+      const ang = (a / 8) * Math.PI * 2;
+      await setCam(page, t.at[0] + Math.sin(ang) * t.r, t.at[1] + t.h, t.at[2] + Math.cos(ang) * t.r,
+        t.at[0], t.at[1], t.at[2], 50);
+      files.push(await shot(page, dir, `a${a}`));
+    }
+    // top and bottom expose broken caps and inverted normals
+    await setCam(page, t.at[0] + 0.01, t.at[1] + t.r, t.at[2], t.at[0], t.at[1], t.at[2], 50);
+    files.push(await shot(page, dir, 'top'));
+    await setCam(page, t.at[0] + 0.01, t.at[1] - t.r * 0.8, t.at[2], t.at[0], t.at[1], t.at[2], 50);
+    files.push(await shot(page, dir, 'bottom'));
+    await contactSheet(browser, files, path.join(OUT, `sheet-turn-${t.name}.png`), 5, `TURNTABLE ${t.name}`);
+    all.push(...files);
+  }
+  await page.context().close();
+  return all;
+}
+
+async function setPerf(browser) {
+  const page = await openPage(browser);
+  await advance(page, 40, HOLD_FWD);
+  const samples = [];
+  for (let i = 0; i < 8; i++) {
+    await advance(page, 60);
+    samples.push(await page.evaluate(() => ({
+      avgMs: window.__game.clock.avgMs,
+      worstMs: window.__game.clock.worstMs,
+      scale: window.__game.pipeline.scale,
+      ...window.__game.pipeline.stats,
+      kitTris: window.__game.stats.tris,
+      colliderTris: window.__game.stats.colliderTris,
+    })));
+  }
+  const avg = samples.reduce((a, s) => a + s.avgMs, 0) / samples.length;
+  const worst = Math.max(...samples.map((s) => s.worstMs));
+  const report = { seed: SEED, viewport: [W, H], dpr: DPR, avgMs: +avg.toFixed(2), worstMs: +worst.toFixed(2), samples };
+  await mkdir(OUT, { recursive: true });
+  await writeFile(path.join(OUT, 'perf.json'), JSON.stringify(report, null, 2));
+  console.log(`  avg ${avg.toFixed(2)}ms  worst ${worst.toFixed(2)}ms  calls ${samples.at(-1).calls}  tris ${samples.at(-1).tris}`);
+  await page.context().close();
+  return report;
+}
+
+// ───────────────────────────────────────────────────────── main
+
+(async () => {
+  await ensureServer();
+  const browser = await chromium.launch({
+    headless: !args.headed,
+    args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', '--enable-unsafe-webgpu'],
+  });
+  try {
+    const sets = SET === 'all' ? ['stills', 'motion', 'turntable', 'perf'] : SET.split(',');
+    for (const s of sets) {
+      console.log(`\n── ${s.toUpperCase()} ─────────────────────────────`);
+      if (s === 'stills') await setStills(browser);
+      else if (s === 'motion') await setMotion(browser);
+      else if (s === 'turntable') await setTurntable(browser);
+      else if (s === 'perf') await setPerf(browser);
+      else console.log('  ? unknown set ' + s);
+    }
+    const n = existsSync(OUT) ? (await readdir(OUT)).length : 0;
+    console.log(`\n· done, ${n} entries in ${path.relative(process.cwd(), OUT)}`);
+  } finally {
+    await browser.close();
+    if (child) child.kill('SIGTERM');
+  }
+})().catch((e) => { console.error(e); if (child) child.kill('SIGTERM'); process.exit(1); });

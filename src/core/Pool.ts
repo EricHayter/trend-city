@@ -1,50 +1,48 @@
-// Fixed-capacity object pool. Particles, projectiles, enemies, debris and damage
-// pops all come from one of these, so the main loop never allocates.
-export class Pool<T> {
+/**
+ * Pool — fixed-capacity free-list pool. Nothing in the game loop calls `new`.
+ * Live objects are kept dense at the front of `items` so iteration is cache-friendly.
+ */
+export class Pool<T extends { alive: boolean }> {
   readonly items: T[] = [];
-  activeCount = 0;
-  private freeList: number[] = [];
-  private activeFlags: boolean[] = [];
-  private onRelease: ((item: T) => void) | null;
+  /** Number of slots currently in use (always the dense prefix of `items`). */
+  count = 0;
+  readonly capacity: number;
 
-  constructor(capacity: number, factory: (index: number) => T, onRelease?: (item: T) => void) {
-    this.onRelease = onRelease || null;
+  constructor(capacity: number, factory: () => T) {
+    this.capacity = capacity;
     for (let i = 0; i < capacity; i++) {
-      this.items.push(factory(i));
-      this.activeFlags.push(false);
-      this.freeList.push(capacity - 1 - i);
+      const it = factory();
+      it.alive = false;
+      this.items.push(it);
     }
   }
 
-  get capacity(): number { return this.items.length; }
-
-  acquire(): T | null {
-    const i = this.freeList.pop();
-    if (i === undefined) return null;
-    this.activeFlags[i] = true;
-    this.activeCount++;
-    (this.items[i] as any).poolIndex = i;
-    return this.items[i];
+  /** Returns an inactive object, or null when the pool is saturated. */
+  spawn(): T | null {
+    if (this.count >= this.capacity) return null;
+    const it = this.items[this.count++];
+    it.alive = true;
+    return it;
   }
 
-  release(item: T): void {
-    const i = (item as any).poolIndex as number;
-    if (i === undefined || !this.activeFlags[i]) return;
-    this.activeFlags[i] = false;
-    this.activeCount--;
-    this.freeList.push(i);
-    if (this.onRelease) this.onRelease(item);
-  }
-
-  isActive(index: number): boolean { return this.activeFlags[index]; }
-
-  releaseAll(): void {
-    for (let i = 0; i < this.items.length; i++) {
-      if (!this.activeFlags[i]) continue;
-      this.activeFlags[i] = false;
-      this.freeList.push(i);
-      if (this.onRelease) this.onRelease(this.items[i]);
+  /** Swap-remove; call from a reverse loop over [0, count). */
+  release(i: number) {
+    const it = this.items[i];
+    it.alive = false;
+    const last = --this.count;
+    if (i !== last) {
+      this.items[i] = this.items[last];
+      this.items[last] = it;
     }
-    this.activeCount = 0;
+  }
+
+  /** Sweep dead entries after an update pass that set `alive = false`. */
+  compact() {
+    for (let i = this.count - 1; i >= 0; i--) if (!this.items[i].alive) this.release(i);
+  }
+
+  clear() {
+    for (let i = 0; i < this.count; i++) this.items[i].alive = false;
+    this.count = 0;
   }
 }

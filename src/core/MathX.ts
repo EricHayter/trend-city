@@ -1,90 +1,118 @@
-/** Allocation-free math helpers shared by every subsystem. */
+/**
+ * MathX — allocation-free math helpers used across the whole game.
+ * Every function here is called many times per frame; none of them allocate.
+ */
+
 export const TAU = Math.PI * 2;
+export const DEG = Math.PI / 180;
 
 export const clamp = (v: number, a: number, b: number) => (v < a ? a : v > b ? b : v);
 export const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 export const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-export const invLerp = (a: number, b: number, v: number) => (b - a === 0 ? 0 : clamp01((v - a) / (b - a)));
+export const invLerp = (a: number, b: number, v: number) => (b === a ? 0 : (v - a) / (b - a));
+export const remap = (v: number, a: number, b: number, c: number, d: number) =>
+  lerp(c, d, clamp01(invLerp(a, b, v)));
+export const sign = (v: number) => (v < 0 ? -1 : v > 0 ? 1 : 0);
+export const sqr = (v: number) => v * v;
 
-/** Framerate-independent exponential smoothing. rate is in 1/seconds. */
-export function damp(current: number, target: number, rate: number, dt: number): number {
-  return target + (current - target) * Math.exp(-rate * dt);
-}
-
-export function moveToward(current: number, target: number, maxDelta: number): number {
-  const d = target - current;
-  if (Math.abs(d) <= maxDelta) return target;
-  return current + Math.sign(d) * maxDelta;
-}
-
-export function smoothstep(edge0: number, edge1: number, x: number): number {
-  const t = clamp01((x - edge0) / (edge1 - edge0));
+export const smoothstep = (t: number) => {
+  t = clamp01(t);
   return t * t * (3 - 2 * t);
-}
+};
+export const smootherstep = (t: number) => {
+  t = clamp01(t);
+  return t * t * t * (t * (t * 6 - 15) + 10);
+};
 
-export function easeOutCubic(t: number) { const u = 1 - t; return 1 - u * u * u; }
-export function easeInCubic(t: number) { return t * t * t; }
-export function easeInOut(t: number) { return t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t); }
-export function easeOutBack(t: number) { const c = 1.70158; const u = t - 1; return 1 + (c + 1) * u * u * u + c * u * u; }
-export function easeOutElastic(t: number) {
-  if (t <= 0) return 0;
-  if (t >= 1) return 1;
-  const p = 0.36;
-  return Math.pow(2, -11 * t) * Math.sin(((t - p / 4) * TAU) / p) + 1;
-}
+/** Framerate-independent exponential approach. `rate` = how much of the gap is closed per second. */
+export const damp = (cur: number, target: number, rate: number, dt: number) =>
+  cur + (target - cur) * (1 - Math.exp(-rate * dt));
 
-export function wrapAngle(a: number): number {
+/** Angle-aware damp; handles wraparound at ±PI. */
+export const dampAngle = (cur: number, target: number, rate: number, dt: number) =>
+  cur + wrapPi(target - cur) * (1 - Math.exp(-rate * dt));
+
+export const wrapPi = (a: number) => {
   a = (a + Math.PI) % TAU;
   if (a < 0) a += TAU;
   return a - Math.PI;
-}
+};
 
-export function angleDamp(current: number, target: number, rate: number, dt: number): number {
-  return current + wrapAngle(target - current) * (1 - Math.exp(-rate * dt));
-}
-
-export interface SpringState { v: number; }
+/** Move toward with a hard per-second speed limit (used for acceleration curves). */
+export const moveTo = (cur: number, target: number, maxDelta: number) => {
+  const d = target - cur;
+  if (Math.abs(d) <= maxDelta) return target;
+  return cur + Math.sign(d) * maxDelta;
+};
 
 /**
- * Semi-implicit spring integrator with sub-stepping. Camera, HUD needles and body
- * squash all share it, so every snappy response in the game has one physical feel.
+ * Critically-damped spring integrator. Returns the new value and writes the new
+ * velocity back into `state[idx]`. Stable at large dt (semi-implicit).
  */
-export function spring(value: number, state: SpringState, target: number, stiffness: number, damping: number, dt: number): number {
-  const iterations = Math.max(1, Math.ceil(dt * 90));
-  const h = dt / iterations;
-  let v = state.v;
-  let x = value;
-  for (let i = 0; i < iterations; i++) {
-    const a = (target - x) * stiffness - v * damping;
-    v += a * h;
-    x += v * h;
-  }
-  state.v = v;
-  return x;
+export function spring(
+  cur: number,
+  target: number,
+  state: Float32Array,
+  idx: number,
+  stiffness: number,
+  damping: number,
+  dt: number,
+): number {
+  const v = state[idx];
+  const a = (target - cur) * stiffness - v * damping;
+  const nv = v + a * dt;
+  state[idx] = nv;
+  return cur + nv * dt;
 }
 
-/** 1D value noise, deterministic from an integer seed. */
-export function valueNoise1(x: number, seed = 0): number {
+// --- easing (used by animation + UI) ---
+export const easeOutQuad = (t: number) => 1 - (1 - t) * (1 - t);
+export const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+export const easeOutQuint = (t: number) => 1 - Math.pow(1 - t, 5);
+export const easeInQuad = (t: number) => t * t;
+export const easeInCubic = (t: number) => t * t * t;
+export const easeInOut = (t: number) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+export const easeOutBack = (t: number) => {
+  const c = 1.70158, c3 = c + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);
+};
+export const easeOutElastic = (t: number) => {
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  return Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * ((2 * Math.PI) / 3)) + 1;
+};
+/** Snappy anticipation-then-overshoot curve, the backbone of the attack poses. */
+export const easeAnticipate = (t: number) => {
+  if (t < 0.28) return -0.22 * smoothstep(t / 0.28);
+  const u = (t - 0.28) / 0.72;
+  return -0.22 + 1.22 * easeOutQuint(u);
+};
+
+/** Deterministic hash noise in [0,1) — used where we want repeatable jitter without RNG state. */
+export const hash1 = (n: number) => {
+  const s = Math.sin(n * 127.1) * 43758.5453123;
+  return s - Math.floor(s);
+};
+export const hash2 = (x: number, y: number) => {
+  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+  return s - Math.floor(s);
+};
+
+/** Cheap 1D value noise; C1 continuous. Good enough for camera shake and idle sway. */
+export function noise1(x: number): number {
   const i = Math.floor(x);
   const f = x - i;
-  const h = (n: number) => {
-    let t = Math.imul(n ^ seed, 0x27d4eb2d);
-    t ^= t >>> 15;
-    return ((t >>> 0) % 100000) / 100000;
-  };
-  const a = h(i);
-  const b = h(i + 1);
   const u = f * f * (3 - 2 * f);
-  return a + (b - a) * u;
+  return lerp(hash1(i) * 2 - 1, hash1(i + 1) * 2 - 1, u);
 }
 
-export function fbm1(x: number, octaves = 4, seed = 0): number {
-  let sum = 0, amp = 0.5, freq = 1, norm = 0;
-  for (let o = 0; o < octaves; o++) {
-    sum += valueNoise1(x * freq, seed + o * 977) * amp;
-    norm += amp;
-    amp *= 0.5;
-    freq *= 2.03;
-  }
-  return sum / norm;
+/** Layered noise for organic drift. */
+export function fbm1(x: number, oct = 3): number {
+  let a = 0.5, s = 0, f = 1;
+  for (let i = 0; i < oct; i++) { s += noise1(x * f) * a; f *= 2.03; a *= 0.5; }
+  return s;
 }
+
+/** Shortest signed difference between two headings, in turns of PI. */
+export const angleTo = (fromX: number, fromZ: number, toX: number, toZ: number) =>
+  Math.atan2(toX - fromX, toZ - fromZ);
