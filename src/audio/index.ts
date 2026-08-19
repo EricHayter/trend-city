@@ -11,8 +11,6 @@ export {
   NoiseBank,
   WindVoice,
   TyreVoice,
-  DrivetrainVoice,
-  SuspensionPool,
   ImpactPool,
   HornVoice,
   BoostVoice,
@@ -23,3 +21,16 @@ export {
   pitchDrop,
 } from './Synths';
 export type { SurfaceTone, UiKind, NoiseKind } from './Synths';
+
+export {
+  JumpVoice,
+  DashVoice,
+  AttackVoice,
+  HitVoice,
+  GrindVoice,
+  MountVoice,
+  PickupVoice,
+  StingerVoice,
+  MusicBed,
+} from './PlayerVoices';
+export type { StingerKind, MusicLayer } from './PlayerVoices';

@@ -1,7 +1,7 @@
 /**
- * RiderMesh — the rider's body and clothing, every vertex generated here.
+ * CharacterMesh — the character's body and clothing, every vertex generated here.
  *
- * There are no imported models in this project, so the rider is lathes, lofted
+ * There are no imported models in this project, so the character is lathes, lofted
  * elliptical tubes and box forms, merged per material and skinned to the bones
  * built in Skeleton.ts.
  *
@@ -54,11 +54,11 @@ import {
   BONE_INDEX,
   FOOT as F,
   REST,
-  RIDER_DIMS as D,
-  RiderSkeleton,
+  BODY_DIMS as D,
+  CharacterSkeleton,
   restPos,
   type BoneName,
-} from './Skeleton';
+} from './CharacterSkeleton';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Small geometry kit
@@ -1651,9 +1651,9 @@ function buildLensParts(): BufferGeometry[] {
 // Geometry cache — one build for every rider on the mountain
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type RiderPart = 'skin' | 'jersey' | 'cloth' | 'rubber' | 'helmet' | 'lens';
+export type CharacterPart = 'skin' | 'jersey' | 'cloth' | 'rubber' | 'helmet' | 'lens';
 
-const PART_RAMP: Record<RiderPart, keyof typeof RAMPS> = {
+const PART_RAMP: Record<CharacterPart, keyof typeof RAMPS> = {
   skin: 'skin',
   jersey: 'jerseyPlayer',
   cloth: 'cloth',
@@ -1662,10 +1662,10 @@ const PART_RAMP: Record<RiderPart, keyof typeof RAMPS> = {
   lens: 'lens',
 };
 
-let geoCache: Record<RiderPart, BufferGeometry> | null = null;
+let geoCache: Record<CharacterPart, BufferGeometry> | null = null;
 
 /** Build (once) the six merged, skinned, outline-ready geometries. */
-export function getRiderGeometries(): Record<RiderPart, BufferGeometry> {
+export function getCharacterGeometries(): Record<CharacterPart, BufferGeometry> {
   if (geoCache) return geoCache;
   const build = (parts: BufferGeometry[], ao: boolean): BufferGeometry =>
     finalizeGeometry(mergeParts(parts), {
@@ -1721,7 +1721,7 @@ export function reHueMaterial(mat: CelMaterial, base: RampPreset, target: Color,
 }
 
 /** Materials with no per-rider variation are built once and shared. */
-const sharedMaterials = new Map<RiderPart, CelMaterial>();
+const sharedMaterials = new Map<CharacterPart, CelMaterial>();
 
 /**
  * How hard each part is held to its identity once the rider gets small.
@@ -1738,7 +1738,7 @@ const sharedMaterials = new Map<RiderPart, CelMaterial>();
  * jersey's outline while leaving the shorts at full width breaks the figure
  * into parts drawn at two different weights.
  */
-const IDENTITY_WEIGHT: Record<RiderPart, { chroma: number; rim: number }> = {
+const IDENTITY_WEIGHT: Record<CharacterPart, { chroma: number; rim: number }> = {
   skin: { chroma: 0.20, rim: 0.55 },
   jersey: { chroma: 0.80, rim: 1.00 },
   cloth: { chroma: 0.40, rim: 0.60 },
@@ -1747,7 +1747,7 @@ const IDENTITY_WEIGHT: Record<RiderPart, { chroma: number; rim: number }> = {
   lens: { chroma: 0.15, rim: 0.55 },
 };
 
-function celOptionsFor(part: RiderPart, identityColor: Color): CelOptions {
+function celOptionsFor(part: CharacterPart, identityColor: Color): CelOptions {
   const w = IDENTITY_WEIGHT[part];
   const o: CelOptions = {
     skinned: true,
@@ -1826,7 +1826,7 @@ const SHARED_IDENTITY: Record<string, Color> = {
   lens: RAMPS.lens.colors[1],
 };
 
-function sharedMaterial(part: RiderPart): CelMaterial {
+function sharedMaterial(part: CharacterPart): CelMaterial {
   let m = sharedMaterials.get(part);
   if (!m) {
     const id = SHARED_IDENTITY[part] ?? RAMPS[PART_RAMP[part]].colors[1];
@@ -1840,7 +1840,7 @@ function sharedMaterial(part: RiderPart): CelMaterial {
 // Assembly
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface RiderMeshOptions {
+export interface CharacterMeshOptions {
   /** Jersey colour, sRGB hex. */
   jersey?: number;
   /** Accent colour, sRGB hex — helmet and shorts trim. */
@@ -1848,7 +1848,7 @@ export interface RiderMeshOptions {
   name?: string;
 }
 
-export interface RiderMeshSet {
+export interface CharacterMeshSet {
   group: Group;
   meshes: SkinnedMesh[];
   hulls: Mesh[];
@@ -1863,8 +1863,8 @@ export interface RiderMeshSet {
  * to the SAME skeleton — which is the only way the ink can follow a deforming
  * character without peeling off at speed.
  */
-export function buildRiderMeshes(skel: RiderSkeleton, opts: RiderMeshOptions = {}): RiderMeshSet {
-  const geos = getRiderGeometries();
+export function buildCharacterMeshes(skel: CharacterSkeleton, opts: CharacterMeshOptions = {}): CharacterMeshSet {
+  const geos = getCharacterGeometries();
   const group = new Group();
   group.name = opts.name ? `${opts.name}:body` : 'rider:body';
 
@@ -1885,7 +1885,7 @@ export function buildRiderMeshes(skel: RiderSkeleton, opts: RiderMeshOptions = {
   );
   owned.push(jerseyMaterial, helmetMaterial);
 
-  const order: RiderPart[] = ['skin', 'jersey', 'cloth', 'rubber', 'helmet', 'lens'];
+  const order: CharacterPart[] = ['skin', 'jersey', 'cloth', 'rubber', 'helmet', 'lens'];
   for (const part of order) {
     const mat =
       part === 'jersey' ? jerseyMaterial : part === 'helmet' ? helmetMaterial : sharedMaterial(part);
@@ -1917,7 +1917,7 @@ export function buildRiderMeshes(skel: RiderSkeleton, opts: RiderMeshOptions = {
 const _idColor = new Color();
 
 /** Apply a rider's identity colours to an already-built set. */
-export function applyRiderColors(set: RiderMeshSet, jersey: number, accent: number): void {
+export function applyCharacterColors(set: CharacterMeshSet, jersey: number, accent: number): void {
   _idColor.setHex(jersey);
   reHueMaterial(set.jerseyMaterial, RAMPS.jerseyPlayer, _idColor, 0.7);
   setIdentityColor(set.jerseyMaterial, _idColor);
@@ -1929,7 +1929,7 @@ export function applyRiderColors(set: RiderMeshSet, jersey: number, accent: numb
 /**
  * Move a material's distance chroma floor onto a new hue.
  *
- * Riders are recoloured after construction (RiderRig calls setJerseyColor on
+ * The character is recoloured after construction (CharacterRig calls setColors on
  * every racer), so the floor has to follow — otherwise every opponent would be
  * held to whatever colour the material happened to be built with, and at range
  * the whole grid would converge on one hue. Which is the exact failure the

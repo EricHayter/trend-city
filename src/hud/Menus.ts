@@ -8,14 +8,23 @@
  * at all in between.
  *
  * The countdown is separate because it has to sit on top of a menu-free frame
- * during the race start, and because it is the one element in the HUD that is
+ * during the stage start, and because it is the one element in the HUD that is
  * genuinely animating every frame for a second and a half.
+ *
+ * ── WHAT THE PIVOT CHANGED HERE ─────────────────────────────────────────────
+ * The results screen was a finishing order: four riders, their times, their
+ * deltas and their trick scores. There is no field any more, so it is now the
+ * stage debrief — a rank letter, the clock, and the collection and mastery
+ * counts out of `StageStats`. Every figure on it comes from that one object,
+ * which is the whole of the fix for the class of bug RESUME.md #10 belongs to:
+ * the screen cannot show a name from one list and a colour from another if
+ * there is only one list.
  */
 
-import type { HudModel, RacerProgress } from '../game/Contracts';
-import { RacePhase } from '../game/Contracts';
-import { HUD_PALETTE, RIDER_COLORS } from '../npr/Palette';
-import { clamp01, dampHL, ease, formatTime } from '../core/MathX';
+import type { HudModel, StageStats } from '../game/Contracts';
+import { StagePhase, StageRank } from '../game/Contracts';
+import { HUD_PALETTE } from '../npr/Palette';
+import { clamp01, ease } from '../core/MathX';
 import {
   HudLayer,
   bar,
@@ -27,11 +36,10 @@ import {
   slab,
   slabPath,
   tick,
-  INK_W,
   SHEAR,
 } from './HudCanvas';
 import { drawText, drawWordmark, measureText, type TextStyle } from './Typeface';
-import { Widget } from './Widgets';
+import { Widget, clockString } from './Widgets';
 
 const P = {
   ink: css(HUD_PALETTE.ink),
@@ -43,6 +51,7 @@ const P = {
   red: css(HUD_PALETTE.red),
   teal: css(HUD_PALETTE.teal),
   violet: css(HUD_PALETTE.violet),
+  boost: css(HUD_PALETTE.boost),
   panel: cssA(HUD_PALETTE.ink, 0.90),
   panelSoft: cssA(HUD_PALETTE.inkSoft, 0.72),
 };
@@ -51,9 +60,9 @@ export type MenuKind = 'none' | 'title' | 'pause' | 'results';
 
 export const DEFAULT_MENU_ITEMS: Record<MenuKind, string[]> = {
   none: [],
-  title: ['START DESCENT'],
-  pause: ['RESUME', 'RESTART RUN', 'QUIT TO TITLE'],
-  results: ['RACE AGAIN', 'QUIT TO TITLE'],
+  title: ['START STAGE'],
+  pause: ['RESUME', 'RESTART STAGE', 'QUIT TO TITLE'],
+  results: ['RETRY STAGE', 'QUIT TO TITLE'],
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +95,8 @@ export class CountdownWidget extends Widget {
   override update(m: HudModel, dt: number, time: number): void {
     const cd = m.countdown;
     if (cd !== null && cd > 0) {
-      // COUNTDOWN_SECONDS is 3.4, so the first tick would read "4". Clamp it.
+      // The director's countdown is longer than three seconds, so the first
+      // tick would read "4". Clamp it.
       const n = Math.min(3, Math.max(1, Math.ceil(cd - 0.0001)));
       if (n !== this.curDigit) {
         this.curDigit = n;
@@ -179,7 +189,7 @@ export interface MenuState {
   selection: number;
 }
 
-/** Where the results screen leaves a hole for the biggest-air replay. */
+/** Where the results screen leaves a hole for the highlight replay. */
 export interface ReplayFrameRect {
   /** In the menu layer's design units. */
   x: number;
@@ -193,6 +203,32 @@ export interface ReplayFrameRect {
   v1: number;
 }
 
+/**
+ * The debrief table, resolved from `StageStats` once per results screen.
+ *
+ * Pooled and rebuilt in place: the screen redraws on every frame of its
+ * stagger, and a `map()` over eleven rows on each of those frames is eleven
+ * objects and a closure per frame for a table that never changes size.
+ */
+interface StatRow {
+  label: string;
+  value: string;
+  /** A second, dimmer figure printed after the value — the "out of" half. */
+  outOf: string;
+  hot: boolean;
+}
+
+const STAT_ROWS = 8;
+
+/** Rank → colour. One table: the letter and its colour cannot disagree. */
+const RANK_COLOR: Record<StageRank, string> = {
+  [StageRank.S]: P.goldHot,
+  [StageRank.A]: P.gold,
+  [StageRank.B]: P.teal,
+  [StageRank.C]: P.violet,
+  [StageRank.D]: P.red,
+};
+
 export class MenuScreen extends Widget {
   kind: MenuKind = 'none';
   items: string[] = [];
@@ -201,9 +237,18 @@ export class MenuScreen extends Widget {
   /** Set true once the results replay is running so the frame label changes. */
   replayActive = false;
 
-  private rows: {
-    pos: number; name: string; time: string; delta: string; score: number; player: boolean; color: string;
-  }[] = [];
+  /** The wordmark and its kicker. The game names itself; the HUD does not. */
+  private titleName = 'DESCENT';
+  private titleTag = 'ONE MOUNTAIN  ·  ONE CLOCK  ·  NO BRAKES';
+
+  private rows: StatRow[] = [];
+  private rowCount = 0;
+  private rank: StageRank = StageRank.C;
+  private clearTime = '0:00.00';
+  private timeLeft = '0:00.00';
+  private newBest = false;
+  private cleared = false;
+
   private age = 0;
   private blink = 0;
   private lastKind: MenuKind = 'none';
@@ -212,11 +257,26 @@ export class MenuScreen extends Widget {
   constructor(layer: HudLayer) {
     super(layer);
     this.enterY = 60;
+    for (let i = 0; i < STAT_ROWS; i++) this.rows.push({ label: '', value: '', outOf: '', hot: false });
   }
 
   /** The replay window in screen UV, for whoever drives the replay camera. */
   get replayFrame(): ReplayFrameRect {
     return this.frame;
+  }
+
+  /**
+   * Name the game. The HUD has no business inventing one, and the old wordmark
+   * was the BMX project's, so the default here is the mountain's name and the
+   * orchestration layer is expected to overwrite it.
+   */
+  setTitle(name: string, tagline?: string): void {
+    this.titleName = name.toUpperCase();
+    if (tagline !== undefined) this.titleTag = tagline.toUpperCase();
+    if (this.kind === 'title') {
+      this.layer.markFurniture();
+      this.invalidate();
+    }
   }
 
   setKind(kind: MenuKind, items?: string[]): void {
@@ -272,20 +332,23 @@ export class MenuScreen extends Widget {
     ctx.lineWidth = 4;
     ctx.stroke();
 
-    drawText(ctx, 'ALPINE DOWNHILL', w * 0.5, h * 0.30 - 26, {
+    drawText(ctx, 'HIGH SPEED DESCENT', w * 0.5, h * 0.30 - 26, {
       size: 24, weight: 0.18, fill: P.gold, ink: P.ink, tracking: 0.46, align: 'center', skew: SHEAR,
     });
-    drawText(ctx, 'SUMMIT TO VALLEY   ·   ONE RUN   ·   NO BRAKES WORTH USING', w * 0.5, h * 0.30 + 236, {
+    drawText(ctx, this.titleTag, w * 0.5, h * 0.30 + 236, {
       size: 18, weight: 0.16, fill: P.paperDim, ink: P.ink, tracking: 0.20, align: 'center', skew: 0,
     });
 
-    // Rider strip along the bottom: the four identity colours, so the palette
-    // introduces itself before the race does.
-    const sw = 120;
-    for (let i = 0; i < RIDER_COLORS.length; i++) {
-      const x = w * 0.5 - (RIDER_COLORS.length * (sw + 10)) * 0.5 + i * (sw + 10);
-      bar(ctx, x, h - 96, sw, 12, css(RIDER_COLORS[i].jersey), P.ink, 2);
-      drawText(ctx, RIDER_COLORS[i].name, x + sw * 0.5, h - 62, {
+    // The three verbs the whole game is made of, along the bottom. It used to
+    // be the four rider colours; the field is gone, and what introduces this
+    // game before it starts is its moveset.
+    const verbs = ['RUN', 'GRIND', 'WALL RUN'];
+    const cols = [P.gold, P.teal, P.violet];
+    const sw = 200;
+    for (let i = 0; i < verbs.length; i++) {
+      const x = w * 0.5 - (verbs.length * (sw + 10)) * 0.5 + i * (sw + 10);
+      bar(ctx, x, h - 96, sw, 12, cols[i], P.ink, 2);
+      drawText(ctx, verbs[i], x + sw * 0.5, h - 62, {
         size: 15, weight: 0.17, fill: P.paperDim, ink: P.ink, tracking: 0.2, align: 'center', skew: 0,
       });
     }
@@ -309,26 +372,14 @@ export class MenuScreen extends Widget {
     slab(ctx, 20, 20, w - 40, h - 40, {
       fill: P.panel, ink: P.ink, inkWidth: 4, cuts: 0b0101, cut: 40, accent: P.gold, accentHeight: 8,
     });
-    drawText(ctx, 'RESULTS', 70, 106, {
-      size: 62, weight: 0.19, fill: P.goldHot, ink: P.ink, inkWidth: 0.06, tracking: 0.16, skew: SHEAR,
+    drawText(ctx, this.cleared ? 'STAGE CLEAR' : 'STAGE FAILED', 70, 106, {
+      size: 58, weight: 0.19, fill: this.cleared ? P.goldHot : P.red, ink: P.ink,
+      inkWidth: 0.06, tracking: 0.16, skew: SHEAR,
     });
     tick(ctx, 62, 132, w * 0.52, 132, 3.4, P.gold);
 
-    // Column heads for the table.
-    const hy = 176;
-    const cols: [string, number, TextStyle['align']][] = [
-      ['POS', 74, 'left'],
-      ['RIDER', 148, 'left'],
-      ['TIME', 470, 'right'],
-      ['DELTA', 610, 'right'],
-      ['TRICKS', 748, 'right'],
-    ];
-    for (const [t, x, a] of cols) {
-      drawText(ctx, t, x, hy, { size: 15, weight: 0.18, fill: P.paperDim, ink: null, tracking: 0.24, align: a, skew: 0 });
-    }
-
     // The replay window. A genuine hole cut in the panel: everything behind the
-    // HUD — the replay camera's view of the biggest air — shows straight
+    // HUD — the replay camera's view of the run's best moment — shows straight
     // through it. The frame is the only thing the HUD draws here.
     this.layoutFrame(w, h);
     const f = this.frame;
@@ -340,7 +391,7 @@ export class MenuScreen extends Widget {
     ctx.lineWidth = 2;
     ctx.strokeRect(f.x - 5, f.y - 5, f.w + 10, f.h + 10);
     cornerTicks(ctx, f.x + 10, f.y + 10, f.w - 20, f.h - 20, 28, 3, P.goldHot);
-    drawText(ctx, 'BIGGEST AIR', f.x, f.y - 22, {
+    drawText(ctx, 'HIGHLIGHT', f.x, f.y - 22, {
       size: 17, weight: 0.18, fill: P.gold, ink: P.ink, tracking: 0.3, skew: SHEAR,
     });
   }
@@ -364,9 +415,9 @@ export class MenuScreen extends Widget {
 
   override update(m: HudModel, dt: number, time: number): void {
     const want: MenuKind =
-      m.phase === RacePhase.Attract ? 'title'
-        : m.phase === RacePhase.Paused ? 'pause'
-          : m.phase === RacePhase.Results ? 'results'
+      m.phase === StagePhase.Title ? 'title'
+        : m.phase === StagePhase.Paused ? 'pause'
+          : m.phase === StagePhase.Results ? 'results'
             : 'none';
     if (want !== this.kind) this.setKind(want);
 
@@ -377,38 +428,51 @@ export class MenuScreen extends Widget {
     this.age += dt;
     this.blink = time;
 
-    if (this.kind === 'results') this.buildRows(m.standings);
+    if (this.kind === 'results' && m.results) this.buildRows(m.results);
 
     this.present(this.kind !== 'none', dt, 0.075);
 
     // While the rows stagger in the layer must redraw; after 1.4s it settles to
     // the blink rate and stops costing anything.
     const settling = this.age < 1.4 ? Math.round(this.age * 60) : 0;
-    this.sig(`${this.kind}|${this.selection}|${settling}|${Math.round(this.blink * 2)}|${this.rows.length}`);
+    this.sig(`${this.kind}|${this.selection}|${settling}|${Math.round(this.blink * 2)}|${this.rank}|${this.rowCount}`);
   }
 
-  private buildRows(standings: RacerProgress[]): void {
-    this.rows.length = 0;
-    const sorted = standings.slice().sort((a, b) => {
-      if (a.finished !== b.finished) return a.finished ? -1 : 1;
-      if (a.finishTime !== null && b.finishTime !== null) return a.finishTime - b.finishTime;
-      return a.position - b.position;
-    });
-    const winner = sorted.length && sorted[0].finishTime !== null ? sorted[0].finishTime : null;
-    for (let i = 0; i < sorted.length; i++) {
-      const r = sorted[i];
-      const c = RIDER_COLORS[r.colorIndex % RIDER_COLORS.length];
-      const t = r.finishTime;
-      this.rows.push({
-        pos: i + 1,
-        name: r.name.toUpperCase(),
-        time: t === null ? 'DNF' : formatTime(t),
-        delta: i === 0 || t === null || winner === null ? '' : '+' + (t - winner).toFixed(2),
-        score: Math.round(r.trickScore),
-        player: r.isPlayer,
-        color: css(c.jersey),
-      });
+  /** One `StageStats`, one table. Written into the pooled rows in place. */
+  private buildRows(s: StageStats): void {
+    const cleared = s.timeLeft > 0;
+    if (cleared !== this.cleared) {
+      this.cleared = cleared;
+      this.layer.markFurniture();
     }
+    this.rank = s.rank;
+    this.clearTime = clockString(s.time);
+    this.timeLeft = clockString(s.timeLeft);
+    this.newBest = s.isNewBest;
+
+    let i = 0;
+    const put = (label: string, value: string, outOf = '', hot = false): void => {
+      if (i >= this.rows.length) return;
+      const r = this.rows[i++];
+      r.label = label;
+      r.value = value;
+      r.outOf = outOf;
+      r.hot = hot;
+    };
+    put('FRAGMENTS', String(s.fragments), `/ ${s.fragmentsTotal}`, s.fragments >= s.fragmentsTotal && s.fragmentsTotal > 0);
+    put('SHARDS', String(s.shards), `/ ${s.shardsTotal}`, s.shards >= s.shardsTotal && s.shardsTotal > 0);
+    put('ENEMIES', String(s.enemiesDefeated), `/ ${s.enemiesTotal}`, s.enemiesDefeated >= s.enemiesTotal && s.enemiesTotal > 0);
+    put('SHORTCUTS', String(s.shortcuts), `/ ${s.shortcutsTotal}`, s.shortcuts >= s.shortcutsTotal && s.shortcutsTotal > 0);
+    put('BEST COMBO', String(Math.round(s.bestCombo)), 'X', s.bestCombo >= 20);
+    put('STYLE', String(Math.round(s.styleScore)), '', s.styleScore > 0);
+    put('GRIND + WALL', String(Math.round(s.grindDistance + s.wallRunDistance)), 'M');
+    // NOTE: `StageStats.topSpeed` is m/s, and the HUD's speed unit is the Spark
+    // display figure. The conversion lives in SparkConstants and is not
+    // permitted here (see the header of Widgets.ts), so this row is labelled in
+    // the unit it actually arrives in rather than silently mislabelled. A
+    // `topSpeedDisplay` on `StageStats` would let it join the rest of the HUD.
+    put('TOP SPEED', s.topSpeed.toFixed(1), 'M/S', false);
+    this.rowCount = i;
   }
 
   // ── Draw ──────────────────────────────────────────────────────────────────
@@ -425,7 +489,7 @@ export class MenuScreen extends Widget {
     const k = ease.snap(clamp01(this.age / 0.55));
     ctx.save();
     ctx.globalAlpha = clamp01(k * 1.5);
-    drawWordmark(ctx, 'DESCENT', w * 0.5, h * 0.30 + 148, 132 * (0.82 + k * 0.18), P.paper, P.ink, 1);
+    drawWordmark(ctx, this.titleName, w * 0.5, h * 0.30 + 148, 132 * (0.82 + k * 0.18), P.paper, P.ink, 1);
     ctx.restore();
 
     if (this.items.length > 1) {
@@ -447,72 +511,102 @@ export class MenuScreen extends Widget {
   }
 
   private drawResults(ctx: CanvasRenderingContext2D, w: number, h: number): void {
-    const rowH = 62;
-    for (let i = 0; i < this.rows.length; i++) {
+    // ── The stat table ───────────────────────────────────────────────────────
+    // Staggered 70 ms apart, each on a snap, so eight rows land like eight
+    // beats rather than appearing as a block.
+    const rowH = 44;
+    const tableX = 62;
+    const tableW = 700;
+    for (let i = 0; i < this.rowCount; i++) {
       const r = this.rows[i];
-      // Stagger: 90ms apart, each on a snap. Four rows land like four beats.
-      const k = ease.snap(clamp01((this.age - 0.18 - i * 0.09) / 0.24));
+      const k = ease.snap(clamp01((this.age - 0.18 - i * 0.07) / 0.24));
       if (k <= 0) continue;
-      const y = 206 + i * (rowH + 10);
-      const bw = (760 - 62) * k;
-
+      const y = 200 + i * rowH;
       ctx.save();
       ctx.globalAlpha = clamp01(k * 1.6);
-      bar(ctx, 62, y, bw, rowH, r.player ? cssA(HUD_PALETTE.gold, 0.85) : P.panelSoft, P.ink, 3);
-      const txt = r.player ? P.ink : P.paper;
-      if (k > 0.55) {
-        // Identity stripe.
-        ctx.save();
-        ctx.beginPath();
-        const s = SHEAR * rowH;
-        ctx.moveTo(62 + s, y);
-        ctx.lineTo(62 + s + 12, y);
-        ctx.lineTo(62 + 12, y + rowH);
-        ctx.lineTo(62, y + rowH);
-        ctx.closePath();
-        ctx.fillStyle = r.color;
-        ctx.fill();
-        ctx.restore();
-
-        drawText(ctx, String(r.pos), 92, y + 42, { size: 30, weight: 0.19, fill: txt, ink: null, skew: 0 });
-        drawText(ctx, r.name, 148, y + 42, { size: 26, weight: 0.16, fill: txt, ink: null, tracking: 0.1, skew: 0 });
-        drawText(ctx, r.time, 470, y + 42, {
-          size: 25, weight: 0.16, fill: txt, ink: null, align: 'right', tabular: true, skew: 0,
+      tick(ctx, tableX, y + rowH - 8, tableX + tableW * k, y + rowH - 8, 1.4, cssA(HUD_PALETTE.paperDim, 0.28));
+      if (k > 0.5) {
+        drawText(ctx, r.label, tableX + 6, y + 26, {
+          size: 18, weight: 0.17, fill: P.paperDim, ink: null, tracking: 0.18, skew: 0,
         });
-        if (r.delta) {
-          drawText(ctx, r.delta, 610, y + 42, {
-            size: 22, weight: 0.16, fill: r.player ? P.ink : P.red, ink: null, align: 'right', tabular: true, skew: 0,
-          });
-        }
-        drawText(ctx, String(r.score), 748, y + 42, {
-          size: 24, weight: 0.17, fill: r.player ? P.ink : P.goldHot, ink: null, align: 'right', tabular: true, skew: 0,
+        const unitSt: TextStyle = {
+          size: 16, weight: 0.16, fill: P.paperDim, ink: null, tracking: 0.08, align: 'right', skew: 0,
+        };
+        const uw = r.outOf ? measureText(r.outOf, unitSt) + 12 : 0;
+        if (r.outOf) drawText(ctx, r.outOf, tableX + tableW, y + 26, unitSt);
+        drawText(ctx, r.value, tableX + tableW - uw, y + 28, {
+          size: 26, weight: 0.17, fill: r.hot ? P.goldHot : P.paper, ink: null,
+          tracking: 0.04, align: 'right', tabular: true, skew: 0,
         });
       }
       ctx.restore();
     }
 
-    // Player summary under the table.
-    const me = this.rows.find((r) => r.player);
-    if (me && this.age > 0.7) {
-      const k = ease.snap(clamp01((this.age - 0.7) / 0.3));
+    // ── The two clocks ───────────────────────────────────────────────────────
+    if (this.age > 0.62) {
+      const k = ease.snap(clamp01((this.age - 0.62) / 0.3));
       ctx.save();
       ctx.globalAlpha = clamp01(k * 1.5);
-      drawText(ctx, 'TRICK SCORE', 62, h - 128, {
+      drawText(ctx, 'CLEAR TIME', tableX, h - 148, {
         size: 16, weight: 0.18, fill: P.gold, ink: P.ink, tracking: 0.3, skew: SHEAR,
       });
-      drawText(ctx, String(me.score), 62, h - 76, {
-        size: 52, weight: 0.17, fill: P.goldHot, ink: P.ink, tabular: true, skew: SHEAR,
-      });
-      drawText(ctx, 'FINISH TIME', 330, h - 128, {
-        size: 16, weight: 0.18, fill: P.gold, ink: P.ink, tracking: 0.3, skew: SHEAR,
-      });
-      drawText(ctx, me.time, 330, h - 76, {
+      drawText(ctx, this.clearTime, tableX, h - 92, {
         size: 52, weight: 0.17, fill: P.paper, ink: P.ink, tabular: true, skew: SHEAR,
+      });
+      drawText(ctx, 'TIME LEFT', tableX + 340, h - 148, {
+        size: 16, weight: 0.18, fill: P.gold, ink: P.ink, tracking: 0.3, skew: SHEAR,
+      });
+      drawText(ctx, this.timeLeft, tableX + 340, h - 92, {
+        size: 52, weight: 0.17, fill: this.cleared ? P.teal : P.red, ink: P.ink, tabular: true, skew: SHEAR,
       });
       ctx.restore();
     }
 
-    if (this.age > 1.1) this.drawItems(ctx, w, 616, 480, 'right');
+    // ── The rank badge ───────────────────────────────────────────────────────
+    // Last in, biggest, and the only thing on the screen that is allowed to
+    // overshoot: it is the verdict, and a verdict that eases in politely is not
+    // one. The plate is an octagon for the same reason the countdown's ring is.
+    if (this.age > 0.95) {
+      const k = ease.snap(clamp01((this.age - 0.95) / 0.34));
+      const f = this.frame;
+      const cx = f.x + f.w * 0.5;
+      const cy = f.y + f.h + 138;
+      const r = 86 * (0.6 + k * 0.4);
+      const col = RANK_COLOR[this.rank] ?? P.paper;
+      ctx.save();
+      ctx.globalAlpha = clamp01(k * 1.5);
+      ctx.beginPath();
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2 + Math.PI / 8;
+        const px = cx + Math.cos(a) * r;
+        const py = cy + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fillStyle = cssA(HUD_PALETTE.ink, 0.92);
+      ctx.fill();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 5;
+      ctx.stroke();
+      drawText(ctx, String(this.rank), cx, cy + r * 0.42, {
+        size: r * 1.05, weight: 0.19, fill: col, ink: P.ink, inkWidth: 0.06,
+        align: 'center', tracking: 0, skew: SHEAR,
+      });
+      drawText(ctx, 'RANK', cx, cy - r - 18, {
+        size: 15, weight: 0.18, fill: P.paperDim, ink: P.ink, tracking: 0.34, align: 'center', skew: SHEAR,
+      });
+      if (this.newBest) {
+        const on = (Math.floor(this.blink * 3) & 1) === 0;
+        drawText(ctx, 'NEW BEST', cx, cy + r + 40, {
+          size: 20, weight: 0.19, fill: on ? P.goldHot : P.gold, ink: P.ink,
+          tracking: 0.3, align: 'center', skew: SHEAR,
+        });
+      }
+      ctx.restore();
+    }
+
+    if (this.age > 1.1) this.drawItems(ctx, w, h - 190, 420, 'right');
 
     // Keep the replay window transparent even after a dynamic redraw.
     const f = this.frame;

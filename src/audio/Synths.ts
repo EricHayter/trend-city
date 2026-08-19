@@ -121,13 +121,13 @@ export function pitchDrop(
   f.exponentialRampToValueAtTime(Math.max(to, 1), t + time);
 }
 
-function gain(ctx: BaseAudioContext, v = 0): GainNode {
+export function gain(ctx: BaseAudioContext, v = 0): GainNode {
   const g = ctx.createGain();
   g.gain.value = v;
   return g;
 }
 
-function biquad(
+export function biquad(
   ctx: BaseAudioContext,
   type: BiquadFilterType,
   freq: number,
@@ -353,7 +353,7 @@ export class WindVoice {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tyres
+// Surface contact
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type SurfaceTone = 'hardpack' | 'gravel' | 'grass' | 'rock' | 'water' | 'snow';
@@ -536,236 +536,6 @@ export class TyreVoice {
     for (const k of ['white', 'pink', 'grain'] as NoiseKind[]) this.sTexG[k].set(0, t);
     this.sSqG.set(0, t);
     this.sSkidG.set(0, t);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Drivetrain: freewheel + chain
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * The freewheel click train — the single detail that makes a bike sound like a
- * bike rather than like a go-kart.
- *
- * A pawl click is an impulse, and there are up to two hundred of them a second
- * at speed. Scheduling two hundred one-shot voices a second from JavaScript is
- * both expensive and, worse, jittery: the click rate would be quantised to the
- * frame rate and you would hear the frame rate.
- *
- * So the train is generated at audio rate instead. A sawtooth oscillator runs at
- * the pawl frequency; a WaveShaper with a steep power curve collapses each ramp
- * into a narrow spike; the spike excites two high-Q band-passes that ring at the
- * pawl's own resonances. Changing the click rate is one `frequency` ramp, the
- * spacing is sample-accurate, and there is no allocation and no scheduling at
- * all. Sweeping the rate glides the clicks exactly the way a coasting wheel does.
- *
- * Pedalling engages the pawls, so the freewheel goes silent and a completely
- * different sound takes over: a lower, broader roller-chain rate through a
- * resonant low band, plus mechanical noise that scales with pedal force. The
- * crossfade between them is the thing that reads as "the rider stopped coasting".
- */
-const PAWL_COUNT = 24;
-const CHAIN_TEETH = 16;
-
-export class DrivetrainVoice {
-  private pawlOsc: OscillatorNode;
-  private pawlGain: GainNode;
-  private chainOsc: OscillatorNode;
-  private chainGain: GainNode;
-  private mechGain: GainNode;
-  private jitterDepth: GainNode;
-
-  private sPawlF: Smooth;
-  private sPawlG: Smooth;
-  private sChainF: Smooth;
-  private sChainG: Smooth;
-  private sMechG: Smooth;
-  private sRing: Smooth;
-
-  constructor(ctx: AudioContext, bank: NoiseBank, out: AudioNode) {
-    // ── Impulse shaper. Shared curve shape, two instances (sharp / soft). ──
-    const sharp = ctx.createWaveShaper();
-    sharp.curve = powerCurve(1024, 34);
-    sharp.oversample = '2x';
-    const soft = ctx.createWaveShaper();
-    soft.curve = powerCurve(1024, 9);
-    soft.oversample = '2x';
-
-    // ── Freewheel ─────────────────────────────────────────────────────────
-    this.pawlOsc = ctx.createOscillator();
-    this.pawlOsc.type = 'sawtooth';
-    this.pawlOsc.frequency.value = 40;
-
-    const ringA = biquad(ctx, 'bandpass', 2600, 14);
-    const ringB = biquad(ctx, 'bandpass', 4400, 20);
-    const ringMix = gain(ctx, 1);
-    this.pawlGain = gain(ctx, 0);
-
-    this.pawlOsc.connect(sharp);
-    sharp.connect(ringA).connect(ringMix);
-    sharp.connect(ringB).connect(ringMix);
-    // A little raw impulse through so the click has a transient, not just a ring.
-    const dry = gain(ctx, 0.28);
-    sharp.connect(dry).connect(ringMix);
-
-    // Per-click amplitude variation, modulated at audio rate by low-passed
-    // noise. Real pawls are not machined to identical tension; a perfectly
-    // even click train sounds synthetic within half a second.
-    const jitterLp = biquad(ctx, 'lowpass', 26, 0.7);
-    this.jitterDepth = gain(ctx, 0.30);
-    bank.tap('white', 1).connect(jitterLp).connect(this.jitterDepth);
-    const jitterVca = gain(ctx, 0.75);
-    this.jitterDepth.connect(jitterVca.gain);
-
-    ringMix.connect(jitterVca).connect(this.pawlGain).connect(out);
-
-    // ── Chain under load ──────────────────────────────────────────────────
-    this.chainOsc = ctx.createOscillator();
-    this.chainOsc.type = 'sawtooth';
-    this.chainOsc.frequency.value = 30;
-    const chainLp = biquad(ctx, 'lowpass', 900, 0.8);
-    const chainRes = biquad(ctx, 'bandpass', 310, 5.5);
-    const chainMix = gain(ctx, 1);
-    this.chainGain = gain(ctx, 0);
-    this.chainOsc.connect(soft);
-    soft.connect(chainLp).connect(chainMix);
-    soft.connect(chainRes).connect(chainMix);
-    chainMix.connect(this.chainGain).connect(out);
-
-    // Mechanical hash: bottom-bracket and derailleur, rises with pedal force.
-    const mechBp = biquad(ctx, 'bandpass', 1150, 2.6);
-    this.mechGain = gain(ctx, 0);
-    bank.tap('pink').connect(mechBp).connect(this.mechGain).connect(out);
-
-    this.sPawlF = new Smooth(this.pawlOsc.frequency, 0.03, 0.004);
-    this.sPawlG = new Smooth(this.pawlGain.gain, 0.05, 0.01);
-    this.sChainF = new Smooth(this.chainOsc.frequency, 0.05, 0.005);
-    this.sChainG = new Smooth(this.chainGain.gain, 0.06, 0.01);
-    this.sMechG = new Smooth(this.mechGain.gain, 0.07, 0.01);
-    this.sRing = new Smooth(ringA.frequency, 0.10, 0.01);
-  }
-
-  start(t: number): void {
-    this.pawlOsc.start(t);
-    this.chainOsc.start(t);
-  }
-
-  /**
-   * @param wheelRate rad/s of the rear wheel
-   * @param drive     0..1 how hard the rider is pedalling
-   * @param grounded  0..1
-   */
-  update(t: number, wheelRate: number, drive: number, grounded: number, duck: number): void {
-    const rate = Math.abs(wheelRate) / (Math.PI * 2);
-    const pawlHz = clamp(rate * PAWL_COUNT, 0.5, 240);
-    this.sPawlF.set(pawlHz, t);
-
-    // The freewheel is loudest at a lazy coast and buzzes down as it speeds up —
-    // that is genuinely how they behave, and it also stops a 200 Hz click train
-    // from turning into a sawtooth drone.
-    const rollOff = 1 - clamp01((pawlHz - 90) / 150) * 0.55;
-    const spinning = clamp01(rate / 1.2);
-    const coast = 1 - clamp01(drive * 1.6);
-    this.sPawlG.set(spinning * coast * rollOff * grounded * 0.085 * duck, t);
-    this.sRing.set(2200 + clamp01(rate / 12) * 900, t);
-
-    // Chain rate follows the same wheel through the gear, an octave-ish below.
-    this.sChainF.set(clamp(rate * CHAIN_TEETH * 0.42, 1, 130), t);
-    this.sChainG.set(clamp01(drive) * (0.25 + spinning * 0.75) * 0.10 * duck, t);
-    this.sMechG.set(clamp01(drive) * 0.035 * duck, t);
-  }
-
-  silence(t: number): void {
-    this.sPawlG.set(0, t);
-    this.sChainG.set(0, t);
-    this.sMechG.set(0, t);
-  }
-}
-
-/**
- * y = x^p over the waveshaper's -1..1 input, DC-corrected.
- *
- * The curve turns a rising sawtooth ramp into a narrow spike at the top of the
- * ramp: higher `power` means a shorter click. The mean of x^p over [0,1] is
- * 1/(p+1), and it is subtracted here — otherwise every click voice contributes
- * a constant DC offset to the master bus, and a dozen of those eats headroom off
- * the limiter for a signal nobody can hear.
- */
-function powerCurve(n: number, power: number): Float32Array<ArrayBuffer> {
-  const c = new Float32Array(n);
-  const dc = 1 / (power + 1);
-  for (let i = 0; i < n; i++) {
-    const x = i / (n - 1); // 0..1 across the -1..1 input range
-    c[i] = Math.pow(x, power) - dc;
-  }
-  return c;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Suspension
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * A damped resonant thunk. Fork and shock are the same voice with different
- * base frequencies; the pitch and level both track compression velocity, so a
- * gentle roll over a root is a soft low knock and a bottom-out on a landing is a
- * hard, higher, louder crack. That mapping is what stops the suspension from
- * sounding like a single stock "thud" sample retriggered.
- */
-class ThunkVoice {
-  private osc: OscillatorNode;
-  private oscGain: GainNode;
-  private noiseGain: GainNode;
-  private bp: BiquadFilterNode;
-  freeAt = 0;
-
-  constructor(ctx: AudioContext, bank: NoiseBank, out: AudioNode, idx: number) {
-    this.osc = ctx.createOscillator();
-    this.osc.type = 'sine';
-    this.osc.frequency.value = 140;
-    this.oscGain = gain(ctx, 0);
-    this.osc.connect(this.oscGain).connect(out);
-
-    this.bp = biquad(ctx, 'bandpass', 240, 2.4);
-    this.noiseGain = gain(ctx, 0);
-    bank.tap(idx % 2 === 0 ? 'pink' : 'white', idx).connect(this.bp).connect(this.noiseGain).connect(out);
-  }
-
-  start(t: number): void {
-    this.osc.start(t);
-  }
-
-  trigger(t: number, level: number, base: number, bright: number): void {
-    const f0 = base * (1 + bright * 0.75);
-    pitchDrop(this.osc.frequency, t, f0, f0 * 0.52, 0.10);
-    strike(this.oscGain.gain, t, level * 0.55, 0.003, 0.13 + level * 0.06);
-
-    this.bp.frequency.setValueAtTime(180 + bright * 520, t);
-    strike(this.noiseGain.gain, t, level * 0.30, 0.002, 0.055);
-    this.freeAt = t + 0.22;
-  }
-}
-
-export class SuspensionPool {
-  private voices: ThunkVoice[] = [];
-  private next = 0;
-
-  constructor(ctx: AudioContext, bank: NoiseBank, out: AudioNode, count = 6) {
-    for (let i = 0; i < count; i++) this.voices.push(new ThunkVoice(ctx, bank, out, i));
-  }
-
-  start(t: number): void {
-    for (const v of this.voices) v.start(t);
-  }
-
-  /** @param cv compression velocity, m/s. Sign is ignored; magnitude is the hit. */
-  trigger(t: number, cv: number, harshness: number, duck: number): void {
-    const level = clamp01(Math.abs(cv) / 3.2);
-    if (level < 0.06) return;
-    let v = this.voices[this.next];
-    for (const c of this.voices) if (c.freeAt < v.freeAt) v = c;
-    this.next = (this.next + 1) % this.voices.length;
-    v.trigger(t, level * duck, 118 + harshness * 46, level * harshness);
   }
 }
 

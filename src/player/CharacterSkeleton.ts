@@ -39,7 +39,7 @@
 
 import { Bone, Skeleton, Vector3 } from 'three';
 
-import { makeLimbState, makeTwoBoneResult, solveTwoBone } from './IK';
+import { makeLimbState, makeTwoBoneResult, solveTwoBone } from './CharacterIK';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bone table
@@ -157,7 +157,7 @@ const AIM_NAME: Partial<Record<BoneName, BoneName>> = {
  * sinks into the ground: the rest skeleton (which puts the ankle `soleDrop`
  * above the floor), the shoe mesh (which is lofted from them), and the rig's
  * foot planting (which solves the ankle onto a contact point). They live here
- * rather than in RiderMesh so there is exactly one definition of where the
+ * rather than in CharacterMesh.ts so there is exactly one definition of where the
  * bottom of the shoe is.
  *
  * The rest foot is LEVEL. `poseLegs` writes the foot bone's rig rotation as the
@@ -197,7 +197,7 @@ export const LIMB = {
 };
 
 /** Radii and shape parameters the mesh builder needs. Metres. */
-export const RIDER_DIMS = {
+export const BODY_DIMS = {
   headRadius: 0.096,
   helmetRadius: 0.118,
   neckRadius: 0.050,
@@ -292,7 +292,7 @@ function v(x: number, y: number, z: number): Vector3 {
 }
 
 /**
- * The rest table. Built once at module load; every RiderSkeleton instance and
+ * The rest table. Built once at module load; every CharacterSkeleton instance and
  * the mesh builder read from it, and nothing ever mutates it.
  */
 export interface RestTable {
@@ -501,7 +501,7 @@ export function restPos(name: BoneName): Vector3 {
  * instance; only the Bone objects and the Skeleton are per-instance, because
  * those are what animate.
  */
-export class RiderSkeleton {
+export class CharacterSkeleton {
   readonly bones: Bone[] = [];
   readonly skeleton: Skeleton;
   readonly root: Bone;
