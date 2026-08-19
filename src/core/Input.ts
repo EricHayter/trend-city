@@ -1,24 +1,45 @@
 /**
- * Input — keyboard and gamepad, normalised into one analogue rider intent.
+ * Input — keyboard and gamepad, normalised into one player intent.
+ *
+ * ── WHAT THE PIVOT CHANGED HERE ─────────────────────────────────────────────
+ * This was a bike's control surface: a smoothed steering axis, a pedal, two
+ * independent brakes, a preload channel and a pitch-lean axis. A platformer
+ * wants none of those. It wants a MOVE VECTOR in camera space plus six
+ * discrete verbs, so that is what this now produces.
  *
  * Two design points that matter downstream:
  *
- *  1. Digital keys are SMOOTHED into analogue axes with asymmetric attack and
- *     release. A keyboard steer input that snaps from 0 to 1 makes the bike
- *     feel like it is on rails; ramping it over ~110ms and releasing over ~70ms
- *     gives keyboard players something close to a stick's feel without making
- *     the controls sluggish.
+ *  1. THE MOVE AXES SNAP. They are not smoothed, and that is a reversal of the
+ *     old file's first design point — deliberately.
+ *
+ *     `PlayerPhysics` reads `hypot(moveX, moveZ)` as the player's INTENT
+ *     magnitude: "half stick is a jog rather than a slow sprint". So ramping a
+ *     keyboard press from 0 to 1 over 60 ms does not soften the start, it tells
+ *     the physics the player wants to jog for 60 ms and then sprint. At
+ *     `GRAVITY.accel`-scale acceleration that is most of a metre surrendered
+ *     off every standing start, and it is a lie about what the player asked for.
+ *
+ *     Smoothing was right for a steering axis, where the smoothing WAS the
+ *     handling model and a snap read as being on rails. It is wrong for a run
+ *     vector, because the equivalent softening already exists downstream and in
+ *     the right place: the physics slews `facing` toward the wish direction at
+ *     `RUN.turnRateLow`..`turnRateHigh` (12 rad/s dropping to 2.2 at top
+ *     speed), so a hard 90-degree input change is a carved corner, not a
+ *     teleport. Smoothing here would be a second, uncalibrated turn limiter in
+ *     front of the tuned one.
+ *
+ *     A real stick still supplies its own curve and is passed through
+ *     untouched, deadzone aside.
  *
  *  2. Every button exposes `pressed`, `justPressed`, `justReleased` and a
- *     `heldFor` timer. Preload-and-pump, bunny hop timing and trick input all
- *     depend on *when* a button was released relative to a physics event, so
- *     edge detection has to survive a frame in which several physics steps ran.
+ *     `heldFor` timer, and the edges SURVIVE A FRAME IN WHICH SEVERAL PHYSICS
+ *     STEPS RAN. That is load-bearing here: physics runs at a fixed 120 Hz and
+ *     a rendered frame consumes two or more steps, so `Game` converts an edge
+ *     into a single-step pulse itself. See `Game.buildPlayerInput`.
  *
  * The whole struct is also settable from outside, which is how the capture
  * harness drives the game to an exact moment without touching the DOM.
  */
-
-import { clamp, moveTowards } from './MathX';
 
 export interface ButtonState {
   pressed: boolean;
@@ -26,7 +47,7 @@ export interface ButtonState {
   justReleased: boolean;
   /** Seconds held. Reset to 0 on release. */
   heldFor: number;
-  /** Seconds since the last release edge — for pump timing windows. */
+  /** Seconds since the last release edge — for buffered-input windows. */
   sinceRelease: number;
 }
 
@@ -34,19 +55,26 @@ function makeButton(): ButtonState {
   return { pressed: false, justPressed: false, justReleased: false, heldFor: 0, sinceRelease: 999 };
 }
 
-/** The action set. Everything the rider can express. */
+/**
+ * The action set. Everything the player can express.
+ *
+ * `crouch` is the slide: held on the ground it drops the hull and trades grip
+ * for gradient, which is why it is a level and not a verb. `dive` is the
+ * down-dash that resolves into a ground pound, and is deliberately a separate
+ * action from `dash` rather than dash-plus-down — a modifier combination is
+ * unreachable at 74 m/s.
+ */
 export const ACTIONS = [
-  'steerLeft',
-  'steerRight',
-  'pedal',
-  'brakeRear',
-  'brakeFront',
-  'crouch',       // preload / manual / bunny-hop charge
-  'leanBack',
-  'leanForward',
-  'trick1',       // tailwhip / x-up modifier
-  'trick2',       // superman / tabletop modifier
+  'moveForward',
+  'moveBack',
+  'moveLeft',
+  'moveRight',
+  'jump',
+  'dash',
+  'attack',
+  'crouch',       // slide / low hull
   'boost',
+  'dive',         // down-dash into a ground pound
   'reset',
   'lookBack',
   'pause',
@@ -57,44 +85,42 @@ export const ACTIONS = [
 export type Action = (typeof ACTIONS)[number];
 
 const DEFAULT_BINDINGS: Record<string, Action> = {
-  KeyA: 'steerLeft',
-  ArrowLeft: 'steerLeft',
-  KeyD: 'steerRight',
-  ArrowRight: 'steerRight',
-  KeyW: 'pedal',
-  ArrowUp: 'pedal',
-  KeyS: 'brakeRear',
-  ArrowDown: 'brakeRear',
-  KeyQ: 'brakeFront',
-  Space: 'crouch',
-  KeyJ: 'leanBack',
-  KeyK: 'leanForward',
-  ShiftLeft: 'trick1',
-  ShiftRight: 'trick1',
-  KeyE: 'trick2',
+  KeyW: 'moveForward',
+  ArrowUp: 'moveForward',
+  KeyS: 'moveBack',
+  ArrowDown: 'moveBack',
+  KeyA: 'moveLeft',
+  ArrowLeft: 'moveLeft',
+  KeyD: 'moveRight',
+  ArrowRight: 'moveRight',
+  Space: 'jump',
+  ShiftLeft: 'dash',
+  ShiftRight: 'dash',
+  KeyJ: 'attack',
+  ControlLeft: 'crouch',
+  KeyC: 'crouch',
   KeyF: 'boost',
+  KeyK: 'dive',
   KeyR: 'reset',
-  KeyC: 'lookBack',
+  KeyB: 'lookBack',
   Escape: 'pause',
   Enter: 'restart',
   KeyV: 'toggleCam',
   Backquote: 'toggleDebug',
 };
 
-/** Smoothed analogue rider intent, consumed by the bike and rider systems. */
-export interface RiderIntent {
-  /** -1 (left) .. +1 (right). Smoothed. */
-  steer: number;
-  /** 0..1 pedal effort. */
-  pedal: number;
-  /** 0..1 rear brake. */
-  brakeRear: number;
-  /** 0..1 front brake. */
-  brakeFront: number;
-  /** 0..1 crouch/compression. This is the preload channel. */
-  crouch: number;
-  /** -1 (forward over the bars) .. +1 (back, manual). */
-  pitchLean: number;
+/**
+ * Player intent, consumed by `Game` and turned into a `PlayerInput`.
+ *
+ * The move vector is in CAMERA space and is not yet resolved against a yaw —
+ * that is `Game`'s job, because the camera is the only thing that knows which
+ * way it is pointing and this class must not depend on it.
+ */
+export interface PlayerIntent {
+  /** -1 (left) .. +1 (right), camera space. */
+  moveX: number;
+  /** -1 (toward the camera) .. +1 (away from it), camera space. */
+  moveZ: number;
   /** Raw button states for edge-sensitive logic. */
   buttons: Record<Action, ButtonState>;
   /** True while any gamepad is providing input — HUD swaps its prompts. */
@@ -102,7 +128,7 @@ export interface RiderIntent {
 }
 
 export class Input {
-  readonly intent: RiderIntent;
+  readonly intent: PlayerIntent;
   private down = new Set<string>();
   private pressedThisFrame = new Set<string>();
   private releasedThisFrame = new Set<string>();
@@ -117,12 +143,8 @@ export class Input {
     const buttons = {} as Record<Action, ButtonState>;
     for (const a of ACTIONS) buttons[a] = makeButton();
     this.intent = {
-      steer: 0,
-      pedal: 0,
-      brakeRear: 0,
-      brakeFront: 0,
-      crouch: 0,
-      pitchLean: 0,
+      moveX: 0,
+      moveZ: 0,
       buttons,
       usingGamepad: false,
     };
@@ -190,6 +212,20 @@ export class Input {
   update(dt: number): void {
     if (this.scripted) {
       this.updateButtonTimers(dt);
+      // The move vector is synthesised in scripted mode too.
+      //
+      // It used to be skipped, on the assumption that a scripted caller writes
+      // the analogue channels directly — which was true of the bike, whose
+      // harness set `intent.steer` and `intent.pedal` by hand. It is a trap
+      // here: `scriptButton('moveForward', true)` is the obvious way to drive
+      // the game from a test, it moves a button the physics never reads, and
+      // the failure is silent — a character that will not walk, with a pressed
+      // button to prove it should. Measured: 2 s of held `moveForward` produced
+      // 0.1 m/s.
+      //
+      // A caller that wants the raw axes writes them AFTER `update()`, which is
+      // where a per-frame override has to go regardless.
+      this.synthMoveFromButtons();
       return;
     }
 
@@ -216,41 +252,34 @@ export class Input {
     this.pressedThisFrame.clear();
     this.releasedThisFrame.clear();
 
-    // ── Analogue synthesis ──────────────────────────────────────────────────
+    // ── The move vector ─────────────────────────────────────────────────────
     const i = this.intent;
 
     if (pad) {
-      // A real stick bypasses the keyboard smoothing entirely — the player is
-      // already providing the curve with their thumb.
-      const ax = deadzone(pad.axes[0] ?? 0, 0.12);
-      i.steer = clamp(ax, -1, 1);
-      i.pedal = Math.max(triggerValue(pad, 7), padActionDown(pad, 'pedal') ? 1 : 0);
-      i.brakeRear = Math.max(triggerValue(pad, 6), padActionDown(pad, 'brakeRear') ? 1 : 0);
-      i.brakeFront = padActionDown(pad, 'brakeFront') ? 1 : 0;
-      i.crouch = padActionDown(pad, 'crouch') ? 1 : 0;
-      i.pitchLean = clamp(-(deadzone(pad.axes[1] ?? 0, 0.15)), -1, 1);
+      // A real stick bypasses everything — the player is already providing the
+      // curve with their thumb. Y is inverted because a stick pushed AWAY from
+      // the player reads negative and means "away from the camera".
+      i.moveX = deadzone(pad.axes[0] ?? 0, 0.12);
+      i.moveZ = -deadzone(pad.axes[1] ?? 0, 0.12);
       i.usingGamepad = true;
     } else {
-      const steerTarget = (i.buttons.steerRight.pressed ? 1 : 0) - (i.buttons.steerLeft.pressed ? 1 : 0);
-      // Asymmetric: ~60ms to full lock, ~55ms to centre. Quick to release so
-      // corrections feel sharp; slower to engage so the bike doesn't snap.
-      const attack = dt / 0.06;
-      const release = dt / 0.055;
-      i.steer =
-        steerTarget === 0
-          ? moveTowards(i.steer, 0, release)
-          : moveTowards(i.steer, steerTarget, attack);
-
-      i.pedal = moveTowards(i.pedal, i.buttons.pedal.pressed ? 1 : 0, dt / (i.buttons.pedal.pressed ? 0.09 : 0.16));
-      i.brakeRear = moveTowards(i.brakeRear, i.buttons.brakeRear.pressed ? 1 : 0, dt / 0.06);
-      i.brakeFront = moveTowards(i.brakeFront, i.buttons.brakeFront.pressed ? 1 : 0, dt / 0.06);
-      // Crouch attacks fast (you can slam into a preload) and releases very
-      // fast (the pop off the lip must be instantaneous to feel like a pump).
-      i.crouch = moveTowards(i.crouch, i.buttons.crouch.pressed ? 1 : 0, dt / (i.buttons.crouch.pressed ? 0.07 : 0.035));
-
-      const leanTarget = (i.buttons.leanBack.pressed ? 1 : 0) - (i.buttons.leanForward.pressed ? 1 : 0);
-      i.pitchLean = moveTowards(i.pitchLean, leanTarget, dt / 0.12);
+      this.synthMoveFromButtons();
     }
+  }
+
+  /**
+   * The keyboard move vector: snapped, not smoothed. See design point 1 in the
+   * header for why there is no ramp here.
+   *
+   * A diagonal is left at magnitude 1.41 rather than normalised, and that is not
+   * an oversight: `PlayerPhysics` clamps `wishMag` to 1 itself, so normalising
+   * would be a second clamp, and a caller that wants the raw pressed pair (a
+   * debug overlay, a replay diff) would have lost it.
+   */
+  private synthMoveFromButtons(): void {
+    const i = this.intent;
+    i.moveX = (i.buttons.moveRight.pressed ? 1 : 0) - (i.buttons.moveLeft.pressed ? 1 : 0);
+    i.moveZ = (i.buttons.moveForward.pressed ? 1 : 0) - (i.buttons.moveBack.pressed ? 1 : 0);
   }
 
   private updateButtonTimers(dt: number): void {
@@ -280,13 +309,14 @@ export class Input {
     return null;
   }
 
-  /** Used by the capture harness and the AI-controlled demo attract mode. */
+  /** Used by the capture harness and the scripted attract mode. */
   setScripted(on: boolean): void {
     this.scripted = on;
     if (on) {
       this.down.clear();
       const i = this.intent;
-      i.steer = i.pedal = i.brakeRear = i.brakeFront = i.crouch = i.pitchLean = 0;
+      i.moveX = 0;
+      i.moveZ = 0;
       for (const a of ACTIONS) {
         const b = i.buttons[a];
         b.pressed = b.justPressed = b.justReleased = false;
@@ -332,19 +362,21 @@ function deadzone(v: number, dz: number): number {
   return Math.sign(v) * ((a - dz) / (1 - dz));
 }
 
-function triggerValue(pad: Gamepad, index: number): number {
-  const b = pad.buttons[index];
-  return b ? b.value : 0;
-}
-
-/** Standard-mapping gamepad layout. */
+/**
+ * Standard-mapping gamepad layout.
+ *
+ * The face buttons are laid out for a runner: jump under the thumb, dash on the
+ * shoulder where it can be held through a corner, attack next to jump. The
+ * triggers are the two levels — boost and slide — because a level wants a
+ * trigger and a verb wants a button.
+ */
 const PAD_MAP: Partial<Record<Action, number>> = {
-  crouch: 0,        // A / cross
-  trick1: 2,        // X / square
-  trick2: 3,        // Y / triangle
-  boost: 1,         // B / circle
-  brakeFront: 4,    // LB
-  pedal: 5,         // RB (also RT via trigger)
+  jump: 0,          // A / cross
+  attack: 2,        // X / square
+  dive: 3,          // Y / triangle
+  dash: 5,          // RB
+  crouch: 6,        // LT
+  boost: 7,         // RT
   lookBack: 10,
   reset: 8,
   pause: 9,

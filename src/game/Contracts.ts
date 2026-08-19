@@ -354,7 +354,11 @@ export interface PlayerState {
   railMountedThisStep: boolean;
   /** True for exactly one step when damage lands. */
   hurtThisStep: boolean;
-  /** Direction the damage came from, world, normalised. */
+  /**
+   * Unit direction the body is thrown, world — `normalize(position - source)`,
+   * so it points AWAY from what hit you and is the axis the knockback is
+   * applied along. Consumers wanting the bearing of the attacker negate it.
+   */
   hurtDirection: Vector3;
 }
 

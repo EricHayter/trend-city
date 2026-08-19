@@ -572,7 +572,9 @@ const TYPE_HOLD = 2.6;
 
 export class TransmissionWidget extends Widget {
   private full = '';
-  private shown = '';
+  /** The revealed prefix of `full`. Named apart from the base class's
+   *  `shown` presence getter, which it would otherwise shadow. */
+  private revealed = '';
   private chars = 0;
   private lastChars = -1;
   private t = 0;
@@ -613,7 +615,7 @@ export class TransmissionWidget extends Widget {
 
     if (this.chars !== this.lastChars) {
       this.lastChars = this.chars;
-      this.shown = this.full.substring(0, this.chars);
+      this.revealed = this.full.substring(0, this.chars);
     }
 
     const on = this.live && stageLive(m.phase) && this.full.length > 0;
@@ -647,7 +649,7 @@ export class TransmissionWidget extends Widget {
     ctx.beginPath();
     ctx.rect(24, py + 32, pw - 48, 40);
     ctx.clip();
-    const tw = drawText(ctx, this.shown, 30, py + 60, st);
+    const tw = drawText(ctx, this.revealed, 30, py + 60, st);
     if (this.chars < this.full.length && (Math.floor(this.t * 4) & 1) === 0) {
       tick(ctx, 30 + tw + 6, py + 60, 30 + tw + 6, py + 60 - st.size, 3, P.teal);
     }
@@ -656,7 +658,7 @@ export class TransmissionWidget extends Widget {
 
   clear(): void {
     this.full = '';
-    this.shown = '';
+    this.revealed = '';
     this.chars = 0;
     this.lastChars = -1;
     this.live = false;

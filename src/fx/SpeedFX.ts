@@ -72,7 +72,8 @@ import {
   Vector3,
 } from 'three';
 
-import { BikeMode, type BikeState } from '../game/Contracts';
+import { MoveMode, type PlayerState } from '../game/Contracts';
+import { YawRateTracker } from './PlayerSignals';
 import { clamp, clamp01, dampHL } from '../core/MathX';
 import { materialIdFor } from '../npr/CelMaterial';
 import { globalUniformBlock, POST_STATE } from '../npr/NprGlobals';
@@ -99,6 +100,13 @@ const _UNIT_Z = new Vector3(0, 0, 1);
 const _ZERO = new Vector3();
 const _delta = new Vector3();
 const _rel = new Vector3();
+/**
+ * Scratch for the per-part rotational velocity, and — written once per frame in
+ * update() — the reconstructed subject spin (0, d(facing)/dt, 0).
+ *
+ * Safe to share: `setSubjectSpin` COPIES what it is handed into `this.omega`
+ * before anything else touches this, so the two uses never overlap in time.
+ */
 const _omega = new Vector3();
 /** Spin-smear scratch: wheel axis / centre / camera, all in world space. */
 const _spinAxisW = new Vector3();
@@ -483,7 +491,8 @@ function createSmearMaterial(colorNear: Color, colorFar: Color): ShaderMaterial 
  * because the annulus is invisible in the two shots that matter:
  *
  *  1. IT IS BURIED INSIDE THE TYRE. The mid-plane of the wheel is 36 mm inside
- *     the tyre casing (BikeModel: tyreCasing 0.0362). The tyre is opaque and
+ *     the tyre casing (the deleted BikeModel's tyreCasing, 0.0362). The tyre is
+ *     opaque and
  *     drawn first; the annulus is depth-tested against it and loses over the
  *     whole tread band, which is precisely the band whose knobs are countable.
  *
@@ -701,7 +710,7 @@ function spokeGeometry(): BufferGeometry {
 let _treadGeometry: BufferGeometry | null = null;
 function treadGeometry(): BufferGeometry {
   if (_treadGeometry) return _treadGeometry;
-  // Unit-wheel-radius space. BikeModel sweeps the carcass at
+  // Unit-wheel-radius space. The deleted BikeModel swept the carcass at
   // (wheelRadius - tyreCasing) with a tube of tyreCasing, and stands ~9 mm of
   // knob on top of that; normalised by wheelRadius = 0.267 that is a major
   // radius of 0.864 and a tube of 0.136. The shell's tube is opened to 0.187
@@ -1068,6 +1077,16 @@ export class SpeedFX {
   /** Subject rotation, shared by every smear entry. See setSubjectSpin(). */
   private omega = new Vector3();
   private pivot = new Vector3();
+  /**
+   * The subject's spin about up, differenced from `facing`.
+   *
+   * The bike published an `angularVelocity` vector; the character has a scalar
+   * heading, so the rate is differenced here. Only the Y channel is ever
+   * non-zero as a result — which is the only channel the whip smear read
+   * anyway, since a body's roll and pitch about its own axis move far less
+   * screen area than its yaw does.
+   */
+  private readonly subjectYaw = new YawRateTracker();
 
   /** The camera's own motion, removed from every part's velocity. */
   private camVel = new VelocityTracker();
@@ -1254,8 +1273,13 @@ export class SpeedFX {
    * `state` may be null outside a race — the post dials then decay to zero
    * rather than sticking on whatever the last frame left them at.
    */
-  update(dt: number, camera: PerspectiveCamera, state: BikeState | null): void {
-    if (state) this.setSubjectSpin(state.angularVelocity, state.position);
+  update(dt: number, camera: PerspectiveCamera, state: PlayerState | null): void {
+    if (state) {
+      this.subjectYaw.step(state.facing, dt);
+      _omega.set(0, this.subjectYaw.rate, 0);
+      // The character rotates about its own feet, which IS `position`.
+      this.setSubjectSpin(_omega, state.position);
+    }
     this.trackCamera(dt, camera);
     this.updateSmears(dt, state);
     for (const s of this.spins) s.update(dt, camera);
@@ -1272,7 +1296,7 @@ export class SpeedFX {
     this.camVel.step(_wp, dt, velBlendFor(dt));
   }
 
-  private updateSmears(dt: number, state: BikeState | null): void {
+  private updateSmears(dt: number, state: PlayerState | null): void {
     // Automatic smear: the rider and bike streak once genuinely fast, and any
     // time the body is rotating hard through a trick — which is where the
     // effect earns its keep, because a 360 at 4 rad/s moves a limb faster
@@ -1286,7 +1310,7 @@ export class SpeedFX {
       // not a trick.
       const spin = Math.min(this.omega.length(), SPEED_TUNING.omegaCeiling);
       const whipping =
-        (state.mode === BikeMode.Airborne || state.mode === BikeMode.Crashing) && state.speed > 3;
+        (state.mode === MoveMode.Airborne || state.mode === MoveMode.Hurt) && state.speed > 3;
       // Onset at 15 m/s (54 km/h) rather than 19 (68 km/h). The old floor sat
       // above almost every speed the course is actually ridden at, so the
       // geometry smear — the one that streaks a limb during a trick — was
@@ -1372,7 +1396,7 @@ export class SpeedFX {
     }
   }
 
-  private updatePost(dt: number, camera: PerspectiveCamera, state: BikeState | null): void {
+  private updatePost(dt: number, camera: PerspectiveCamera, state: PlayerState | null): void {
     let targetIntensity = 0;
     let targetRadial = 0;
 
@@ -1398,8 +1422,8 @@ export class SpeedFX {
 
       // Air is quiet. Losing the lines in flight is what makes them come back
       // as a punch on landing.
-      if (state.mode === BikeMode.Airborne) targetIntensity *= 0.68;
-      if (state.mode === BikeMode.Crashing) targetIntensity *= 0.12;
+      if (state.mode === MoveMode.Airborne) targetIntensity *= 0.68;
+      if (state.mode === MoveMode.Hurt) targetIntensity *= 0.12;
 
       // RADIAL BLUR IS A BLUR, and it is the only genuinely photographic
       // operator in the post stack: an 8-tap accumulation along the ray from
@@ -1443,7 +1467,7 @@ export class SpeedFX {
     POST_STATE.chromaticAberration = this.chroma;
   }
 
-  private updateFocus(dt: number, camera: PerspectiveCamera, state: BikeState): void {
+  private updateFocus(dt: number, camera: PerspectiveCamera, state: PlayerState): void {
     _dir.copy(state.velocity);
     _dir.y *= 0.35; // flatten the vertical so a big air doesn't fling the focus
     if (_dir.lengthSq() < 1.0) {

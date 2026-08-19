@@ -9,23 +9,42 @@
  * The order is not arbitrary and changing it will break things:
  *
  *   FIXED STEP (120 Hz, from the engine's accumulator)
- *     race.fixedUpdate  ->  per racer: AI/player input -> bike.step -> tricks
+ *     buildPlayerInput   drain the queued button pulses, resolve the move
+ *                        vector against the camera yaw
+ *     player.step        collision, modes, attachments
+ *     stage.step         clock, progress, splits, stats
  *
  *   RENDER (once per displayed frame, on interpolated state)
- *     input                the player's raw intent for THIS frame
- *     effects.beginFrame   returns the time-scaled dt (slow-mo lives here)
- *     race.updateVisual    bikes interpolate, rider rigs solve IK onto them
- *     camera               reads the finished bike transform, never a stale one
- *     effects.update       dust/debris/speed lines follow the camera it just set
- *     hud / audio          read the resolved frame
- *     post.render          shadows -> G-buffer -> hulls -> cel -> lines -> grade
- *     hud.render           drawn over the graded frame, never through the LUT
+ *     input              the player's raw intent for THIS frame
+ *     queueEdges         latch this frame's press edges for the next step
+ *     effects.beginFrame returns the time-scaled dt (slow-mo lives here)
+ *     player.updateVisual the rig solves IK on an INTERPOLATED transform
+ *     camera             reads the finished player transform, never a stale one
+ *     effects.update     dust/debris/speed lines follow the camera it just set
+ *     hud / audio        read the resolved frame
+ *     post.render        shadows -> G-buffer -> hulls -> cel -> lines -> grade
+ *     hud.render         drawn over the graded frame, never through the LUT
  *
- * The rider rig MUST solve after the bike has been placed and before the camera
- * reads anything, or the hands lag the bars by one frame — which is visible.
+ * The rig MUST solve after the physics has been placed and before the camera
+ * reads anything, or the character lags the camera by one frame.
+ *
+ * ── WHY INPUT IS QUEUED RATHER THAN READ ────────────────────────────────────
+ * `Engine.advance()` runs every fixed step for a frame and THEN calls the render
+ * function, and `Input.clearEdges()` is called at the end of that render. So a
+ * `justPressed` edge exists only inside `render()` — no `fixedUpdate` can ever
+ * observe one. A jump read directly off the button state would therefore either
+ * be missed entirely or, worse, be seen as "pressed" by every one of the frame's
+ * two-plus steps: `PlayerPhysics` re-arms its double jump on any step where
+ * `input.jump` is true, so a held key would spend the whole air-charge budget in
+ * 16 ms.
+ *
+ * `queueEdges()` latches each press during render; `buildPlayerInput()` drains
+ * the latch on the next step that runs. The latch PERSISTS across a frame that
+ * produces no fixed steps at all, which happens at high refresh rates and is
+ * exactly when a dropped jump would be least explicable.
  */
 
-import { Color, PerspectiveCamera, Vector3 } from 'three';
+import { PerspectiveCamera, Vector3 } from 'three';
 
 import { Engine } from '../core/Engine';
 import { Input } from '../core/Input';
@@ -37,22 +56,18 @@ import { RIDER_COLORS } from '../npr/Palette';
 
 import { createTerrain, type Terrain } from '../terrain';
 import { createTrack, type Track } from '../track';
-import { Bike, createBike } from '../bike';
-import { attachRigToBike, createRiderRig } from '../rider';
+import { createPlayer, type Player } from '../player';
 import { createEffects, type Effects } from '../fx';
 import { Hud } from '../hud';
 import { AudioEngine } from '../audio';
-import { RaceDirector, type RacerSpec } from '../ai';
+import { createStageDirector, type StageDirector } from './StageDirector';
 
 import {
   CameraMode,
-  RacePhase,
-  type BikeInput,
-  type IBike,
-  type IRiderRig,
+  StagePhase,
+  type PlayerInput,
 } from './Contracts';
 import { clamp01 } from '../core/MathX';
-import { BIKE, COUNTDOWN_SECONDS } from './WorldConstants';
 
 export interface GameOptions {
   params: URLSearchParams;
@@ -75,13 +90,13 @@ export interface CaptureApi {
 }
 
 /**
- * A capture setup. `t` is the fraction along the course the player is
- * teleported to; the camera is placed by `camera` (+ `orbit` when framing by
- * hand), and `input` is held for every step until the next setup.
+ * A capture setup. `t` is the fraction along the route the player is teleported
+ * to; the camera is placed by `camera` (+ `orbit` when framing by hand), and
+ * `input` is held for every step until the next setup.
  */
 interface Situation {
   /**
-   * Where on the course, as a fraction of track length. Anchored to the REAL
+   * Where on the route, as a fraction of track length. Anchored to the REAL
    * section boundaries reported by `track.sectionRanges`, not guessed — a pose
    * sitting exactly on a boundary reads as the previous section, which is how
    * the first review set ended up with a `rockgarden` frame labelled
@@ -89,45 +104,41 @@ interface Situation {
    * reviewing the wrong feature.
    */
   t: number;
+  /** Ground speed along the route tangent at spawn, m/s. */
   speed: number;
-  /** Height above the trail at spawn — greater than 0 puts the rider in the air. */
+  /** Height above the ground at spawn — greater than 0 puts the player in the air. */
   lift?: number;
   /**
-   * Vertical launch velocity, m/s. An air pose needs the rider to be genuinely
-   * ballistic over the feature; dropping one in at a fixed height just makes a
-   * rider hanging in space, and the settle frames put it straight back on the
-   * ground before the shutter opens.
+   * Vertical launch velocity, m/s. An air pose needs the character to be
+   * genuinely ballistic over the feature; dropping one in at a fixed height
+   * just makes a figure hanging in space, and the settle frames put it straight
+   * back on the ground before the shutter opens.
    */
   launch?: number;
   /**
    * Fixed physics steps to run before the shutter, at 120 Hz.
    *
-   * The jumps work for real now — a rider placed on the run-in with speed and
-   * no impulse launches off the kicker and lands on the deck. So an air pose
-   * should be REACHED by riding into it, not faked with a vertical impulse:
-   * the artificial launch on `ravine-gap` flew the rider straight past the
-   * receiving ramp and 13 m into the far hillside. The harness only settles 12
-   * frames before shooting, which is 4 m of travel, so a pose that needs to
-   * cover 25 m of run-in has to say so.
+   * An air pose should be REACHED by running into it, not faked with a vertical
+   * impulse: an artificial launch on the old `ravine-gap` flew the rider past
+   * the receiving ramp and 13 m into the far hillside. The harness only settles
+   * 12 frames before shooting, which at these speeds is a long way, so a pose
+   * that needs to cover ground on the run-in has to say so.
+   *
+   * A word on scale. `RUN.max` is 74 m/s, so 120 steps — one second — covers
+   * 74 m. Prerolls here are consequently much SHORTER than the bike's were for
+   * the same distance, and a preroll tuned on the bike will overshoot the whole
+   * feature.
    */
   preroll?: number;
   camera: CameraMode;
   orbit?: { yaw: number; pitch: number; dist: number; spin?: number };
-  input?: Partial<BikeInput>;
-  /** Put the bike down on the first step, deterministically. */
-  crash?: boolean;
-  /**
-   * Where the pack goes. Rivals used to spawn 3.5 m behind the player, which
-   * is inside the chase boom, so an opponent filled a screen quadrant. Moving
-   * them to 12 m+ behind fixed that and created the opposite failure: a
-   * sequence named `pack-race` with no rival in a single frame of it, because
-   * behind the player is exactly where a chase camera cannot see.
-   */
-  pack?: 'behind' | 'ahead';
+  input?: Partial<PlayerInput>;
+  /** Take a scripted hit partway into the captured window. */
+  hurt?: boolean;
 }
 
-// Section boundaries as a fraction of the 3839 m course, measured from the
-// built track rather than assumed:
+// Section boundaries as a fraction of the course, measured from the built track
+// rather than assumed:
 //   technical-start 0.000–0.109   scree-run    0.109–0.269
 //   switchbacks     0.269–0.518   rock-garden  0.518–0.600
 //   tabletop        0.600–0.651   ravine-gap   0.651–0.702
@@ -137,79 +148,78 @@ interface Situation {
 const SITUATIONS: Record<string, Situation> = {
   'summit-wide':        { t: 0.004, speed: 0,  camera: CameraMode.Orbit, orbit: { yaw: 0.35, pitch: 0.22, dist: 52, spin: 0 } },
   'summit-rider':       { t: 0.020, speed: 6,  camera: CameraMode.Orbit, orbit: { yaw: 0.95, pitch: 0.18, dist: 9 } },
+  // Tight enough to read the face and the hands. The character is 1.8 m, so a
+  // 3.4 m stand-off is a chest-up crop rather than the full figure.
   'rider-closeup':      { t: 0.075, speed: 12, camera: CameraMode.Orbit, orbit: { yaw: 2.30, pitch: 0.10, dist: 3.4 } },
   'rider-threequarter': { t: 0.075, speed: 12, camera: CameraMode.Orbit, orbit: { yaw: 0.95, pitch: 0.20, dist: 5.0 } },
-  // Side-on and low, so the bike is a readable silhouette rather than a
-  // three-quarter rear view half-occluded by the rider's own leg.
-  'bike-detail':        { t: 0.075, speed: 8,  camera: CameraMode.Orbit, orbit: { yaw: 1.57, pitch: 0.02, dist: 2.3 } },
-  'scree-speed':        { t: 0.189, speed: 19, camera: CameraMode.Chase, input: { pedal: 1 } },
-  'switchback-lean':    { t: 0.394, speed: 14, camera: CameraMode.Chase, input: { steer: 0.38, pedal: 0.4 } },
-  'treeline-silhouette':{ t: 0.470, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 2.65, pitch: 0.06, dist: 16 } },
-  'rockgarden-low':     { t: 0.559, speed: 13, camera: CameraMode.Orbit, orbit: { yaw: 0.60, pitch: -0.08, dist: 6.5 } },
-  // Genuinely ballistic off the table, not parked in the air above it.
-  // Placed on the run-in and ridden off the lip. No impulse.
-  'tabletop-air':       { t: 0.6175, speed: 19, preroll: 271, camera: CameraMode.Chase, input: { airPitch: 0.22 } },
-  // Placed just short of the hole (0.675) and launched, so the rider is
-  // arcing OVER the ravine rather than standing next to it.
-  // The harness settles 12 frames (0.2 s) before the shutter, which carries the
-  // rider ~4 m. Spawn that far SHORT of the near lip so the shutter opens with
-  // the rider over the hole and still rising.
-  // KNOWN BAD: at 22 m/s the rider launches off the natural rollover before the
-  // ravine, peaks at 7.7 m, and falls PAST the far lip into the hole,
-  // accelerating to 150 km/h inside the mountain. The gap is not currently
-  // clearable. Framed on the approach until the jump itself is fixed.
-  'ravine-gap':         { t: 0.6665, speed: 22, preroll: 96, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.26, dist: 9.5 } },
-  'ridge-exposure':     { t: 0.757, speed: 16, camera: CameraMode.Orbit, orbit: { yaw: 0.20, pitch: 0.30, dist: 26 } },
-  streambed:            { t: 0.849, speed: 12, camera: CameraMode.Chase },
-  // Short of the line, so the gate is ahead of the rider and in frame.
-  'finish-sprint':      { t: 0.955, speed: 20, camera: CameraMode.Chase, input: { pedal: 1 } },
-  crash:                { t: 0.559, speed: 17, camera: CameraMode.Orbit, orbit: { yaw: 1.25, pitch: 0.18, dist: 8 }, crash: true },
+  // Side-on and low, so the run cycle is a readable silhouette rather than a
+  // three-quarter rear view half-occluded by the character's own leg. This is
+  // the pose the locomotion rig is judged on.
+  'run-cycle':          { t: 0.075, speed: 22, camera: CameraMode.Orbit, orbit: { yaw: 1.57, pitch: 0.04, dist: 5.2 } },
+  'scree-speed':        { t: 0.189, speed: 44, camera: CameraMode.Chase, input: { moveZ: 1 } },
+  'switchback-lean':    { t: 0.394, speed: 34, camera: CameraMode.Chase, input: { moveX: 0.38, moveZ: 1 } },
+  'treeline-silhouette':{ t: 0.470, speed: 26, camera: CameraMode.Orbit, orbit: { yaw: 2.65, pitch: 0.06, dist: 16 } },
+  'rockgarden-low':     { t: 0.559, speed: 26, camera: CameraMode.Orbit, orbit: { yaw: 0.60, pitch: -0.08, dist: 6.5 } },
+  // Genuinely ballistic off the table, not parked in the air above it. Placed on
+  // the run-in and run off the lip. No impulse.
+  'tabletop-air':       { t: 0.6100, speed: 40, preroll: 90, camera: CameraMode.Chase, input: { moveZ: 1 } },
+  // Placed short of the hole (0.675) and launched, so the character is arcing
+  // OVER the ravine rather than standing next to it.
+  'ravine-gap':         { t: 0.6690, speed: 46, preroll: 30, launch: 12, camera: CameraMode.Orbit, orbit: { yaw: 2.10, pitch: 0.26, dist: 11 } },
+  'ridge-exposure':     { t: 0.757, speed: 32, camera: CameraMode.Orbit, orbit: { yaw: 0.20, pitch: 0.30, dist: 26 } },
+  streambed:            { t: 0.849, speed: 24, camera: CameraMode.Chase },
+  // A slide down a gradient: the hull drops, the dust rate changes, and the
+  // camera sits low enough to see both.
+  slide:                { t: 0.230, speed: 40, camera: CameraMode.Chase, input: { moveZ: 1, crouch: true } },
+  // Short of the line, so the goal is ahead of the character and in frame.
+  'finish-sprint':      { t: 0.955, speed: 52, camera: CameraMode.Chase, input: { moveZ: 1 } },
+  // Was `crash`. The name is kept because the capture harness's default pose
+  // list uses it, and because it is still the pose that reviews impact
+  // punctuation — it is now a scripted hit rather than a bike going down.
+  crash:                { t: 0.559, speed: 34, camera: CameraMode.Orbit, orbit: { yaw: 1.25, pitch: 0.18, dist: 8 }, hurt: true },
   'valley-vista':       { t: 0.300, speed: 0,  camera: CameraMode.Orbit, orbit: { yaw: 0.0, pitch: 0.06, dist: 180, spin: 0 } },
-  // The player hunting the pack, so the rivals are in the chase frustum.
-  'pack-race':          { t: 0.205, speed: 19, camera: CameraMode.Chase, pack: 'ahead', input: { pedal: 1 } },
 };
 
-/** Motion setups: a situation plus the input held for the whole sequence. */
 /**
  * Motion setups. Each is a DISTINCT run that contains its own event.
  *
  * They previously all pointed at a handful of shared situations and differed
  * only by an `input` field, which for the air sequences was inert because the
- * rider was never airborne. A motion review found the result: `landing`,
- * `tabletop-air` and `trick-360` were byte-for-intent the same capture (mean
- * absolute pixel difference 1.18 on 0-255), and so were `scree-speed` and
- * `pack-race`. Five of eight sequences were two runs.
+ * subject was never airborne. A motion review found the result: three of the
+ * eight sequences were byte-for-intent the same capture (mean absolute pixel
+ * difference 1.18 on 0-255). Five of eight sequences were two runs.
  *
- * `preroll` is in 120 Hz physics steps and is the whole game here. Measured on
- * the tabletop: takeoff is 127 steps after the preroll finishes and the flight
- * lasts 46. A sequence settles 4 render frames (8 steps) before its first
- * shutter, so a preroll of 248 puts the takeoff about 8 captured frames in —
- * inside the window a reviewer is looking at, rather than before it.
+ * `preroll` is in 120 Hz physics steps and is the whole game here. A sequence
+ * settles 4 render frames (8 steps) before its first shutter, so the preroll has
+ * to put the event a few captured frames IN — inside the window a reviewer is
+ * looking at, rather than before it.
  */
-const SEQUENCES: Record<string, { from: string; input?: Partial<BikeInput>; preroll?: number }> = {
-  launch:         { from: 'summit-rider', input: { pedal: 1 } },
-  // 0.35, not 0.9. Full stick steers off a 3.7 m half-width ribbon in 0.9 s,
-  // and every downstream "defect" measured in this capture followed from the
-  // rider being off the trail and then in free fall down the side of it — a
-  // frozen corner marker (the HUD reads a monotonic-max track projection),
-  // -7.97 m/s^2 "coasting", +16.7 m/s^2 "acceleration" which was gravity. The
-  // sequence is meant to show a switchback being carved, not a departure.
-  switchback:     { from: 'switchback-lean', input: { steer: 0.35, pedal: 0.5 } },
-  // Takeoff ~8 frames in, apex ~20, touchdown ~31.
-  'tabletop-air': { from: 'tabletop-air', preroll: 248, input: { airPitch: 0.28 } },
-  // Starts in the air so the whole capture is the descent, the touchdown and
-  // the absorption chain that follows it.
-  landing:        { from: 'tabletop-air', preroll: 286, input: { airPitch: 0.1 } },
+const SEQUENCES: Record<string, { from: string; input?: Partial<PlayerInput>; preroll?: number }> = {
+  launch:         { from: 'summit-rider', input: { moveZ: 1 } },
+  // 0.35, not 0.9. Full stick leaves a 3.7 m half-width ribbon almost
+  // immediately at these speeds, and every downstream "defect" measured in the
+  // old capture followed from the subject being off the trail and then in free
+  // fall down the side of it. The sequence is meant to show a switchback being
+  // carved, not a departure.
+  switchback:     { from: 'switchback-lean', input: { moveX: 0.35, moveZ: 1 } },
+  'tabletop-air': { from: 'tabletop-air', preroll: 84, input: { moveZ: 1 } },
+  // Starts later on the same run-in so the whole capture is the descent, the
+  // touchdown and the absorption chain that follows it.
+  landing:        { from: 'tabletop-air', preroll: 128, input: { moveZ: 1 } },
   crash:          { from: 'crash' },
-  'scree-speed':  { from: 'scree-speed', input: { pedal: 1 } },
-  // Same launch, full yaw authority held — airYaw is inert on the ground and
-  // takes hold the moment the wheels leave it.
-  'trick-360':    { from: 'tabletop-air', preroll: 248, input: { airYaw: 1 } },
-  'pack-race':    { from: 'pack-race', input: { pedal: 1 } },
+  'scree-speed':  { from: 'scree-speed', input: { moveZ: 1 } },
+  // The air dash. `dash` is a PULSE — see `setScripted` — so it fires on the
+  // first step of the sequence and then the coast is what gets photographed,
+  // which is the whole point: a dash held every step would re-fire until the
+  // air charges ran out and the capture would be of the charge budget emptying.
+  'air-dash':     { from: 'tabletop-air', preroll: 96, input: { moveZ: 1, dash: true } },
+  slide:          { from: 'slide', input: { moveZ: 1, crouch: true } },
 };
 
 const _v = new Vector3();
 const _fwd = new Vector3();
+/** Where a scripted capture hit comes from. See `pendingHurtSteps`. */
+const _hurtFrom = new Vector3();
 
 export class Game {
   private engine: Engine;
@@ -218,29 +228,47 @@ export class Game {
   sky!: Sky;
   terrain!: Terrain;
   track!: Track;
-  race!: RaceDirector;
+  player!: Player;
+  stage!: StageDirector;
   effects!: Effects;
   hud!: Hud;
   audio!: AudioEngine;
   post!: PostPipeline;
 
-  private bikes: Bike[] = [];
   private captureControlled = false;
   /**
    * Frames left to suppress HUD popups for after a capture teleport.
    *
-   * Jumping the player 700 m down the course crosses three checkpoints inside a
-   * single physics step, so the race layer legitimately fires three split
-   * popups at once and the HUD stacks them for their full 1.9 s life. That is
-   * correct behaviour reacting to an event that never happens in play — it is
-   * the review harness contaminating the thing it exists to review.
+   * Jumping the player 700 m down the route crosses three checkpoints inside a
+   * single physics step, so the stage layer legitimately fires three split
+   * popups at once and the HUD stacks them for their full life. That is correct
+   * behaviour reacting to an event that never happens in play — it is the review
+   * harness contaminating the thing it exists to review.
    */
   private suppressPopupFrames = 0;
-  /** Physics steps until a scripted capture crash fires. 0 = none pending. */
-  private pendingCrashSteps = 0;
-  private scriptedInput: BikeInput | null = null;
+  /** Physics steps until a scripted capture hit fires. 0 = none pending. */
+  private pendingHurtSteps = 0;
+  private scriptedInput: PlayerInput | null = null;
   private debugOverlay = false;
   private headless: boolean;
+
+  /**
+   * The one `PlayerInput` the physics ever sees, mutated in place.
+   *
+   * A fresh object per step is 120 allocations a second on the hot path, and
+   * this codebase does not do that anywhere else in a physics path.
+   */
+  private readonly playerInput: PlayerInput = {
+    moveX: 0, moveZ: 0, cameraYaw: 0,
+    jump: false, jumpHeld: false, dash: false, crouch: false,
+    attack: false, boost: false, dive: false,
+  };
+
+  // Press latches. Set during render, drained by the next step that runs.
+  private queuedJump = false;
+  private queuedDash = false;
+  private queuedAttack = false;
+  private queuedDive = false;
 
   readonly capture: CaptureApi;
 
@@ -255,12 +283,11 @@ export class Game {
         this.input.setScripted(true);
         this.engine.stop();
         this.engine.setFixedPixelRatio(this.engine.stats.pixelRatio || 2);
-        this.race?.forceRacing();
+        this.stage?.forceRunning();
       },
       releaseControl: () => {
         this.captureControlled = false;
         this.scriptedInput = null;
-        if (this.race) this.race.player.scripted = null;
         this.input.setScripted(false);
         this.engine.setFixedPixelRatio(null);
         this.engine.start();
@@ -307,7 +334,7 @@ export class Game {
     scene.add(this.terrain.object);
     await frame();
 
-    progress(0.62, 'Cutting the trail');
+    progress(0.62, 'Cutting the route');
     this.track = createTrack(this.terrain, { geometry: true, applyCarve: true });
     scene.add(this.track.object);
     await frame();
@@ -345,53 +372,45 @@ export class Game {
 
     progress(0.84, 'HUD and audio');
     this.hud = new Hud(this.engine.renderSize.x, this.engine.renderSize.y, {
-      initialPhase: RacePhase.Attract,
+      initialPhase: StagePhase.Title,
     });
-    this.audio = new AudioEngine({ autoTrigger: true, volume: this.headless ? 0 : 0.8 });
+    this.audio = new AudioEngine({ volume: this.headless ? 0 : 0.8 });
     await frame();
 
-    progress(0.90, 'Riders');
-    this.race = new RaceDirector({
+    progress(0.90, 'The character');
+    this.startTransform(_v, _fwd);
+    this.player = createPlayer({
+      terrain: this.terrain,
+      start: _v,
+      facing: yawFromForward(_fwd),
+      rig: { name: 'player' },
+    });
+    scene.add(this.player.object);
+
+    // Wiring the physics reaches, and the rig never does.
+    //
+    // Traversal and enemies are deliberately null. `RailNetwork` and `WallSet`
+    // exist but there is no `ITraversal` facade to assemble them behind yet, and
+    // `src/combat/` is geometry and constants with no `IEnemyDirector`. Both
+    // are handled as null throughout `PlayerPhysics`, so what runs is running,
+    // jumping, dashing, diving and sliding down a real mountain — grinding,
+    // wall-running, springs and homing are unreachable until those two facades
+    // land. That is a missing subsystem, not a broken one.
+    this.player.setAudio(this.audio);
+    this.player.setEffects(this.effects);
+    this.player.setTraversal(null);
+    this.player.setEnemies(null);
+
+    this.effects.setSubject(this.player.state);
+    this.effects.cameraDirector.resetTo(this.player.state);
+    await frame();
+
+    progress(0.94, 'Stage');
+    this.stage = createStageDirector({
       terrain: this.terrain,
       track: this.track,
-      intent: this.input.intent,
-      makeBike: (spec) => this.makeBike(spec),
-      makeRig: (spec) => this.makeRig(spec),
-      effects: this.effects,
       audio: this.audio,
-      scene,
-      enableGhost: !this.headless,
     });
-    scene.add(this.race.object);
-
-    // Two links that can only be made once both halves of a racer exist. The
-    // factories are handed a spec, not each other, so neither can do this.
-    //
-    //  - the bike needs the racer's TrickState, or a tailwhip never spins the
-    //    frame about the steerer;
-    //  - the rig needs the bike's ANCHORS, or the hands IK to a fallback bar
-    //    derived from BIKE_GEOM and stay put through every whip and bar twist.
-    //    That fallback keeps a rider posable with no bike at all, which is what
-    //    the capture harness wants, but it is wrong the moment there is a bike.
-    for (const r of this.race.racers) {
-      const b = r.bike as Bike;
-      if (typeof b.linkTrick === 'function') b.linkTrick(r.trick);
-      attachRigToBike(r.rig, r.bike);
-    }
-
-    this.effects.setSubject(this.race.player.bike.state);
-    this.effects.cameraDirector.setReplaySource(this.race.replay);
-
-    // The boom solver needs to know the pack exists. Without this the camera
-    // has no idea other riders are there, and since they spawn 3.5/8.0/12.5 m
-    // behind the player they sit directly ON the boom — which is what put an
-    // opponent 3.7 m from the lens and filled the frame with a stranger's torso
-    // while the actual subject was 7.8 m out. The director falls back to a
-    // name-based scene scan without this, which works but is fragile.
-    const occluders = this.race.racers
-      .filter((r) => r !== this.race.player)
-      .map((r) => r.bike.state);
-    this.effects.cameraDirector.setOccluders?.(occluders);
     await frame();
 
     progress(0.97, 'Wiring loop');
@@ -399,30 +418,29 @@ export class Game {
     this.engine.onRender((dt, alpha, elapsed) => this.render(dt, alpha, elapsed));
     this.engine.onResize((w, h) => this.resize(w, h));
 
-    if (this.headless) this.race.forceRacing();
-    else this.race.beginCountdown();
+    if (this.headless) this.stage.forceRunning();
+    else this.stage.begin();
 
     progress(1.0, 'Ready');
   }
 
-  private makeBike(spec: RacerSpec): IBike {
-    const bike = createBike({
-      terrain: this.terrain,
-      frameColor: new Color(spec.frame),
-      name: `bike:${spec.id}`,
-      detail: spec.isPlayer ? 'full' : 'reduced',
-      // The pack gets a little extra balance authority. Four AI riders falling
-      // over on the first berm is not "they make mistakes", it is a bug that
-      // looks like a design choice.
-      stabilityBias: spec.isPlayer ? 0 : 0.35,
-    });
-    bike.setCameraRef(this.engine.camera);
-    this.bikes.push(bike);
-    return bike;
-  }
-
-  private makeRig(spec: RacerSpec): IRiderRig {
-    return createRiderRig(spec);
+  /**
+   * Where the character starts, and which way it faces.
+   *
+   * `startTransform` puts it on the centreline of the trail rather than on a
+   * grid — there is nobody to line up beside — and the height is then taken from
+   * the HEIGHTFIELD rather than from the ribbon.
+   *
+   * That is not a detail. `PlayerPhysics` collides with `terrain.heightAt`; the
+   * ribbon mesh is only what you see, and it sits proud of the heightfield by
+   * design. Spawning feet on the ribbon leaves the character standing in the air
+   * with no contact, which means no ground dust and no run cycle on frame zero —
+   * a defect an FX reviewer correctly saw on the old build and could not have
+   * fixed, because it was not in the FX.
+   */
+  private startTransform(outPos: Vector3, outFwd: Vector3): void {
+    this.track.startTransform(0, outPos, outFwd, 1);
+    outPos.y = this.terrain.heightAt(outPos.x, outPos.z);
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -430,23 +448,113 @@ export class Game {
   // ───────────────────────────────────────────────────────────────────────────
 
   private fixedUpdate(dt: number): void {
-    if (this.pendingCrashSteps > 0 && --this.pendingCrashSteps === 0) {
-      (this.race.player.bike as Bike).physics.forceCrash(0.82);
+    if (this.pendingHurtSteps > 0 && --this.pendingHurtSteps === 0) {
+      // From straight ahead, so the knockback throws the character back down the
+      // slope it came up and the hit reads in a chase or a side-on orbit.
+      forwardFromYaw(this.player.state.facing, _hurtFrom);
+      _hurtFrom.multiplyScalar(4).add(this.player.state.position);
+      this.player.damage(1, _hurtFrom);
     }
-    if (this.scriptedInput) this.race.player.scripted = this.scriptedInput;
-    this.race.fixedUpdate(dt);
-    // The visual layer needs to know whether the rider is driving the cranks;
-    // the physics does not care, so it is passed separately rather than being
-    // smuggled into BikeState.
-    for (const r of this.race.racers) {
-      const b = r.bike as Bike;
-      const input = (r as unknown as { input?: BikeInput }).input;
-      if (input && typeof b.noteInput === 'function') b.noteInput(input);
-    }
+
+    const input = this.scriptedInput ? this.applyScripted() : this.buildPlayerInput();
+    this.player.step(input, dt);
+    this.stage.step(this.player.state, dt);
+  }
+
+  /**
+   * This step's input, from the live intent.
+   *
+   * The four verbs are drained latches; the rest are levels read straight off
+   * the buttons. See the header for why the verbs cannot be read directly.
+   */
+  private buildPlayerInput(): PlayerInput {
+    const i = this.input.intent;
+    const b = i.buttons;
+    const p = this.playerInput;
+
+    p.moveX = i.moveX;
+    p.moveZ = i.moveZ;
+    // The move vector is in camera space, so it is meaningless without the yaw
+    // it is relative to. This is the camera's ACTUAL view heading, published at
+    // the end of its own compose — not the boom's aim, which differs from it by
+    // the corner-lead arc and would send the character off at an angle to the
+    // pressed direction on every corner.
+    p.cameraYaw = this.effects.cameraDirector.yaw;
+
+    p.jump = this.queuedJump;
+    p.dash = this.queuedDash;
+    p.attack = this.queuedAttack;
+    p.dive = this.queuedDive;
+    this.queuedJump = false;
+    this.queuedDash = false;
+    this.queuedAttack = false;
+    this.queuedDive = false;
+
+    p.jumpHeld = b.jump.pressed;
+    p.crouch = b.crouch.pressed;
+    p.boost = b.boost.pressed;
+    return p;
+  }
+
+  /**
+   * A scripted step, for the capture harness.
+   *
+   * The levels are held for every step of the sequence; the verbs fire ONCE and
+   * are then cleared out of the scripted template. A held `jump` re-arms the
+   * double jump on every step and a held `dash` empties the air charges in a
+   * frame — see the header — so a sequence that asks for a dash gets exactly one.
+   */
+  private applyScripted(): PlayerInput {
+    const s = this.scriptedInput!;
+    const p = this.playerInput;
+    p.moveX = s.moveX;
+    p.moveZ = s.moveZ;
+    // A SCRIPTED STICK IS RESOLVED AGAINST THE CHARACTER, NOT THE CAMERA.
+    //
+    // The live path resolves the move vector against the camera's view yaw,
+    // which is correct because that is what the player is looking down. A
+    // capture cannot use it. `applySituation` runs its whole preroll inside
+    // `setPose` with no render in between, so `cameraDirector.yaw` is still
+    // whatever the PREVIOUS pose composed — an Orbit pose 180 degrees away, in
+    // the general case. A sequence asking for `moveZ: 1` would then run the
+    // character sideways off the trail, and every reading taken downstream of
+    // that would be a measurement of the wrong run. RESUME.md documents five
+    // separate defects that were artefacts of the harness rather than the game;
+    // this is that shape of bug, caught before it produced one.
+    //
+    // Against `facing`, `moveZ: 1` means "forward along the route" and
+    // `moveX: 1` means "to the character's right", for every pose, with no
+    // dependence on where a camera happens to be pointing. It is also what
+    // `PlayerPhysics.stepFinished` does for the victory run-out, so the
+    // convention is already in the codebase.
+    p.cameraYaw = this.player.state.facing;
+    p.jumpHeld = s.jumpHeld;
+    p.crouch = s.crouch;
+    p.boost = s.boost;
+
+    p.jump = s.jump;
+    p.dash = s.dash;
+    p.attack = s.attack;
+    p.dive = s.dive;
+    s.jump = false;
+    s.dash = false;
+    s.attack = false;
+    s.dive = false;
+    return p;
+  }
+
+  /** Latch this frame's press edges. See the header. */
+  private queueEdges(): void {
+    const b = this.input.intent.buttons;
+    if (b.jump.justPressed) this.queuedJump = true;
+    if (b.dash.justPressed) this.queuedDash = true;
+    if (b.attack.justPressed) this.queuedAttack = true;
+    if (b.dive.justPressed) this.queuedDive = true;
   }
 
   private render(realDt: number, alpha: number, elapsed: number): void {
     this.input.update(realDt);
+    if (!this.captureControlled) this.queueEdges();
     this.handleUiInput();
 
     // Slow-mo and the impact-frame hold both live in the effects layer, and
@@ -455,25 +563,26 @@ export class Game {
     const dt = this.effects.beginFrame(realDt);
     const camera = this.engine.camera as PerspectiveCamera;
 
-    // 1. Bikes interpolate, rider rigs solve their IK onto the finished bikes.
-    this.race.updateVisual(alpha, dt, elapsed);
+    // 1. The rig solves IK on an interpolated transform. At 74 m/s a 120 Hz step
+    //    covers 0.62 m, so a rig drawn on the raw physics state judders by up to
+    //    two thirds of a metre whenever the display and step rates beat.
+    this.player.updateVisual(alpha, dt, elapsed);
 
     // 2. Camera reads the resolved player transform.
-    const player = this.race.player.bike.state;
-    this.effects.cameraDirector.update(player, dt, elapsed, realDt);
+    const state = this.player.state;
+    this.effects.cameraDirector.update(state, dt, elapsed, realDt);
 
     // 3. FX follow the camera the director just placed.
     this.effects.update(dt, elapsed, camera, realDt);
 
     // 4. Readouts.
-    const hudModel = this.race.getHudModel();
+    const hudModel = this.stage.getHudModel();
     if (this.suppressPopupFrames > 0) {
       this.suppressPopupFrames--;
       hudModel.popups.length = 0;
     }
     this.hud.update(hudModel, dt, elapsed);
-    this.audio.setRiderInput(this.race.player.input);
-    this.audio.update(player, (this.race.player.bike as Bike).physics.surface, dt);
+    this.audio.update(state, state.surface, dt);
 
     // 5. Globals, sky, streaming, then the whole pipeline.
     updateNprGlobals(elapsed, camera, this.engine.renderSize.x, this.engine.renderSize.y);
@@ -502,14 +611,42 @@ export class Game {
     if (this.captureControlled) return;
     const b = this.input.intent.buttons;
     if (b.pause.justPressed) {
-      if (this.race.phase === RacePhase.Paused) this.race.resume();
-      else this.race.pause();
+      if (this.stage.phase === StagePhase.Paused) this.stage.resume();
+      else this.stage.pause();
     }
-    if (b.restart.justPressed) this.race.restart();
+    if (b.restart.justPressed) this.restart();
+    if (b.reset.justPressed) this.respawn();
     if (b.toggleDebug.justPressed) {
       this.debugOverlay = !this.debugOverlay;
       this.post.setDebugView(this.debugOverlay ? 'lines' : 'off');
     }
+  }
+
+  /** Whole run from the top. */
+  private restart(): void {
+    this.stage.restart();
+    this.respawn();
+    this.stage.begin();
+  }
+
+  /**
+   * Put the character back on the start line without touching the clock.
+   *
+   * Everything stateful downstream of the transform has to be told, or the
+   * character arrives wearing the dust it kicked up before it moved and the
+   * camera spends half a second flying across the mountain to catch up. The
+   * camera's own teleport guard would re-seat it anyway, but doing it here means
+   * the first rendered frame after a respawn is already correct rather than
+   * correct-on-the-second-frame.
+   */
+  private respawn(): void {
+    this.startTransform(_v, _fwd);
+    this.player.reset(_v, yawFromForward(_fwd));
+    this.effects.reset();
+    this.effects.cameraDirector.resetTo(this.player.state);
+    this.stage.resetRun();
+    this.hud.resetRun();
+    this.suppressPopupFrames = 4;
   }
 
   private resize(width: number, height: number): void {
@@ -523,101 +660,41 @@ export class Game {
 
   private applySituation(name: string, prerollOverride?: number): boolean {
     const s = SITUATIONS[name];
-    if (!s || !this.race) return false;
+    if (!s || !this.stage) return false;
 
-    this.race.forceRacing();
+    this.stage.forceRunning();
     this.scriptedInput = null;
-    this.race.player.scripted = null;
 
-    // Put every racer on the course at this point, the player leading and the
-    // pack fanned out behind, so a wide shot has a race in it rather than one
-    // rider and three dots still on the start line.
     const total = this.track.length;
-    const racers = this.race.racers;
-    for (let i = 0; i < racers.length; i++) {
-      const r = racers[i];
-      const bike = r.bike as Bike;
-      const isPlayer = r === this.race.player;
-      // Opponents go BEYOND the camera boom, never inside it.
-      //
-      // 3.5 m was the old first-rival offset and the chase boom settles around
-      // 4.8 m behind the player — so the harness was parking a rival almost
-      // exactly where the camera lives. Every chase capture had an opponent
-      // filling a screen quadrant, near-plane-clipped, while the actual subject
-      // was a 110 px figure behind it. The camera's own occluder avoidance
-      // cannot help: there is nowhere for a 4.8 m boom to go that is not inside
-      // a rider standing 3.5 m away. Real race spacing is metres, not
-      // centimetres, and the review set has to show the race the player sees.
-      const ahead = s.pack === 'ahead';
-      const back = isPlayer ? 0 : (ahead ? -(9 + i * 7) : 12 + i * 6.5);
-      const d = Math.max(1, Math.min(total - 2, s.t * total - back));
-      const sample = this.track.sampleAtDistance(d);
+    const d = Math.max(1, Math.min(total - 2, s.t * total));
+    const sample = this.track.sampleAtDistance(d);
 
-      _v.copy(sample.position);
-      // Spawn the pack ON the racing line, not fanned off it.
-      //
-      // A 2.4 m lateral offset put the AI's lateral-correction term into
-      // saturation: it held full opposite lock for the whole capture, its
-      // offset GREW from 2.4 m to 5.9 m, and it scrubbed 68 km/h down to 13
-      // doing it. Whether the root cause is a sign disagreement between this
-      // offset and the tracker's convention or simply an over-strong gain, the
-      // fan was cosmetic and the correct start for a racing line is on it. They
-      // separate naturally through their own line preferences.
-      void isPlayer;
-      _fwd.copy(sample.tangent);
+    _v.copy(sample.position);
+    _fwd.copy(sample.tangent);
 
-      // Spawn on whichever surface is HIGHER: the ribbon mesh or the
-      // heightfield under it.
-      //
-      // The physics collides with the heightfield; the ribbon is only what you
-      // see. They currently disagree by as much as 8 m (measured: scree +1.06
-      // to +2.15, tabletop -7.92 to +1.89, streambed -4.22 to +3.15), so
-      // spawning on the ribbon buried the bike 1-2.5 m underground in half the
-      // poses and dropped it 5 m in others. Taking the max means a pose is
-      // never spawned inside the mountain — the bike settles the short distance
-      // instead of exploding out of it. This is a GUARD, not the fix: the carve
-      // needs to make the two agree, and that is tracked separately.
-      // Spawn relative to the surface the WHEELS COLLIDE WITH.
-      //
-      // The ribbon mesh sits 0.18 m proud of the heightfield by design, and the
-      // physics rides the heightfield. Spawning on the ribbon therefore left the
-      // bike 0.15 m in the air, so frame 0 of every sequence had neither wheel
-      // grounded and emitted no dust — a defect an FX reviewer correctly saw and
-      // could not have fixed, because it is not in the FX.
-      //
-      // The guard is for the ravine, where the terrain is genuinely 13 m below
-      // the ribbon because that IS the gap. Past a metre and a half of
-      // disagreement, trust the ribbon rather than spawn into the hole.
-      const groundY = this.terrain.heightAt(_v.x, _v.z);
-      if (Math.abs(groundY - _v.y) < 1.5 || groundY > _v.y) _v.y = groundY;
+    // Spawn on the surface the character COLLIDES with, and guard the ravine.
+    //
+    // The physics rides the heightfield; the ribbon is only what you see, and
+    // the two disagree by as much as 8 m in places (measured: scree +1.06 to
+    // +2.15, tabletop -7.92 to +1.89, streambed -4.22 to +3.15). Taking the
+    // heightfield means the character is never spawned inside the mountain. The
+    // exception is the ravine, where the terrain is genuinely 13 m below the
+    // ribbon because that IS the gap: past a metre and a half of disagreement,
+    // trust the ribbon rather than spawn into the hole.
+    const groundY = this.terrain.heightAt(_v.x, _v.z);
+    if (Math.abs(groundY - _v.y) < 1.5 || groundY > _v.y) _v.y = groundY;
+    _v.y += s.lift ?? 0;
 
-      // `sample.position` is the ribbon SURFACE, and the bike's origin is on
-      // the AXLE LINE — one wheel radius above whatever it is standing on.
-      // Spawning the origin at the surface buried both wheels 0.27 m in the
-      // ground; the suspension answered with a 14 kN spring force and launched
-      // the bike, so every capture pose was shot from a rider who had been
-      // flung into the air on frame one. That is why no pose ever showed dust:
-      // the wheels were never touching. Less a little static sag so the springs
-      // settle instead of visibly dropping.
-      _v.y += BIKE.wheelRadius - 0.03 + (s.lift ?? 0);
-
-      bike.reset(_v, _fwd);
-      bike.state.velocity.copy(_fwd).multiplyScalar(s.speed);
-
-      // Tell the racer where it now is. Without this its track tracker keeps
-      // the distance it had before the teleport, so an AI wakes up steering
-      // toward a target hundreds of metres behind it — the pack covered 0 m in
-      // 40 s and sat 97% off-track from frame zero.
-      (r as unknown as { reseat?: (p: Vector3, d?: number) => void }).reseat?.(_v, d);
-      if (s.launch) bike.state.velocity.y += s.launch;
-    }
+    this.player.reset(_v, yawFromForward(_fwd));
+    this.player.state.velocity.copy(_fwd).multiplyScalar(s.speed);
+    if (s.launch) this.player.state.velocity.y += s.launch;
 
     const dir = this.effects.cameraDirector;
     dir.mode = s.camera;
     if (s.camera === CameraMode.Orbit && s.orbit) {
       dir.setOrbit(s.orbit.yaw, s.orbit.pitch, s.orbit.dist, s.orbit.spin ?? 0.35);
     }
-    dir.resetTo(this.race.player.bike.state);
+    dir.resetTo(this.player.state);
 
     // Wipe every stateful effect before the situation is set up.
     //
@@ -630,56 +707,60 @@ export class Game {
     // needs to be wiped in this call too.
     this.effects.reset();
 
-    // Ride into the situation rather than being dropped into it.
     // Make the CLOCK agree with the position we teleported to.
     //
-    // A capture jumps the player straight to a fraction of the course without
-    // riding there, so the elapsed timer stayed near zero: the review set had
-    // frames reading DESCENT PROFILE 96% at 72 km/h beside TIME 0:00.19. A
+    // A capture jumps the player straight to a fraction of the route without
+    // running there, so the elapsed timer stayed near zero: the old review set
+    // had frames reading DESCENT PROFILE 96% at 72 km/h beside TIME 0:00.19. A
     // reviewer judging composition and readability is entitled to a frame whose
     // own HUD is internally consistent, and a nonsense clock is a defect they
-    // will and did report. Estimated from the distance covered at a nominal
-    // pace rather than simulated, because simulating 3.8 km per pose would cost
-    // minutes per capture run.
-    const NOMINAL_PACE = 17.5; // m/s averaged over the descent
-    const covered = s.t * this.track.length;
-    this.race.raceTime = COUNTDOWN_SECONDS + covered / NOMINAL_PACE;
-    for (const r of this.race.racers) r.progress.raceTime = this.race.elapsed;
+    // will and did report. Estimated from the distance covered at a nominal pace
+    // rather than simulated, because simulating the whole route per pose would
+    // cost minutes per capture run.
+    this.stage.setElapsed(d / NOMINAL_PACE);
+
+    // Set the scripted input BEFORE the preroll, or the preroll runs on a
+    // neutral stick and the situation is reached by coasting rather than by
+    // being driven into. That was inert on the bike, where the spawn velocity
+    // did the work; it is not inert here, because a character with no stick
+    // input decelerates.
+    if (s.input) this.setScripted(s.input);
 
     const preroll = prerollOverride ?? s.preroll ?? 0;
-    for (let i = 0; i < preroll; i++) this.race.fixedUpdate(1 / 120);
+    for (let i = 0; i < preroll; i++) this.fixedUpdate(1 / 120);
 
     // Swallow the checkpoint splits the teleport just crossed, and wipe any
     // popup already on screen from the previous pose.
     this.suppressPopupFrames = 4;
+    this.stage.resetRun();
     this.hud.resetRun();
 
-    // Deferred, so the impact lands INSIDE the captured window.
+    // Deferred, so the hit lands INSIDE the captured window.
     //
-    // It used to fire here, which is before the preroll and before the
-    // harness's settle frames — so `crashCount` was already 1 at f0000 and the
-    // flash, the freeze and the camera push-in had all burned off screen. The
-    // sequence whose entire purpose is to show an impact never contained one.
-    // Counted in 120 Hz steps: 8 for the harness settle plus ~20 to put the hit
-    // about ten captured frames in.
-    this.pendingCrashSteps = s.crash ? 28 : 0;
+    // It used to fire here, which is before the preroll and before the harness's
+    // settle frames — so the flash, the freeze and the camera push-in had all
+    // burned off screen before the shutter opened. The sequence whose entire
+    // purpose is to show an impact never contained one. Counted in 120 Hz steps:
+    // 8 for the harness settle plus ~20 to put the hit about ten captured frames
+    // in.
+    this.pendingHurtSteps = s.hurt ? 28 : 0;
 
-    if (s.input) this.setScripted(s.input);
     return true;
   }
 
-  private setScripted(partial: Partial<BikeInput>): void {
+  private setScripted(partial: Partial<PlayerInput>): void {
     this.scriptedInput = {
-      steer: 0, pedal: 0, brakeRear: 0, brakeFront: 0, crouch: 0, pitchLean: 0,
-      airPitch: 0, airYaw: 0, airRoll: 0, wantBoost: false, wantHop: false,
+      moveX: 0, moveZ: 0, cameraYaw: 0,
+      jump: false, jumpHeld: false, dash: false, crouch: false,
+      attack: false, boost: false, dive: false,
       ...partial,
     };
-    if (this.race) this.race.player.scripted = this.scriptedInput;
   }
 
   dispose(): void {
     this.input.dispose();
-    this.race?.dispose();
+    this.stage?.dispose();
+    this.player?.dispose();
     this.effects?.dispose();
     this.hud?.dispose();
     this.audio?.dispose();
@@ -688,6 +769,26 @@ export class Game {
     this.post?.dispose();
     this.sky?.dispose();
   }
+}
+
+/** m/s averaged over the descent, for the capture clock estimate. */
+const NOMINAL_PACE = 38;
+
+/**
+ * Yaw from a forward vector, matching `PlayerState.facing`'s convention.
+ *
+ * The physics uses `forward = (sin yaw, 0, cos yaw)`, so the inverse is
+ * `atan2(x, z)` and NOT the `atan2(z, x)` a reader coming from a maths text
+ * would write. Getting this backwards spawns the character facing across the
+ * route instead of down it.
+ */
+function yawFromForward(fwd: Vector3): number {
+  return Math.atan2(fwd.x, fwd.z);
+}
+
+/** The same convention, forwards. Writes into `out` and returns it. */
+function forwardFromYaw(yaw: number, out: Vector3): Vector3 {
+  return out.set(Math.sin(yaw), 0, Math.cos(yaw));
 }
 
 function frame(): Promise<void> {

@@ -194,7 +194,7 @@ export class WallSet implements IWallSet {
       _m.makeBasis(_ax, _ay, _az);
       _m.setPosition(cx - nx * WALL_THICKNESS * 0.5, panel.baseY + h * 0.5, cz - nz * WALL_THICKNESS * 0.5);
       geo.applyMatrix4(_m);
-      this.meshes.add(geo, 'rock', 'wall-plate', d, { hatchStrength: undefined, outlineWidth: 0.011 });
+      this.meshes.add(geo, 'rock', 'wall-plate', d, { outlineWidth: 0.011 });
     }
 
     // Grip stripe: a shallow ledge proud of the face at run height. This is the

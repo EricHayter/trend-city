@@ -3,15 +3,22 @@
  *
  * createEffects() wires the five subsystems into one object that implements
  * IEffects, and then does the thing that actually matters for integration:
- * it DERIVES almost everything from BikeState on its own.
+ * it DERIVES almost everything from PlayerState on its own.
  *
- * Hand it the player's BikeState once per frame and it will emit wheel dust at
- * the right rate for the surface and the slip, throw gravel out of a skid,
- * splash the stream, detect the landing from the mode transition (not just the
- * single-physics-step flag, which a 120Hz sim can raise and clear between two
- * rendered frames), fire the dust burst, decide whether the landing earned an
- * impact hold, drive the speed lines, and smear the rider. The Game never has
- * to know what a puff is.
+ * Hand it the player's PlayerState once per frame and it will emit dust under
+ * the feet at the right rate for the surface and the gait, throw gravel out of
+ * a slide, splash the stream, detect the landing from the mode transition (not
+ * just the single-physics-step flag, which a 120Hz sim can raise and clear
+ * between two rendered frames), fire the dust burst, decide whether the landing
+ * earned an impact hold, drive the speed lines, and smear the character. The
+ * Game never has to know what a puff is.
+ *
+ * ── PORTED FROM THE BIKE ────────────────────────────────────────────────────
+ * The emission below used to run off two `WheelState` contacts, each with its
+ * own load, slip ratio and lateral slip. A runner has one contact and none of
+ * those channels, so what drives the rate now is the surface, the ground speed
+ * and whether the body is sliding or grinding — see `emitFeet`. The
+ * reconstructions the whole subsystem shares live in `PlayerSignals.ts`.
  *
  * Manual control is still there — every IEffects method does exactly what it
  * says — but the automatic path is the intended one, because the alternative
@@ -34,37 +41,38 @@ import {
 } from 'three';
 
 import {
-  BikeMode,
+  MoveMode,
   SurfaceKind,
-  type BikeState,
+  type PlayerState,
   type IEffects,
   type ITerrain,
   type SurfaceProperties,
-  type WheelState,
 } from '../game/Contracts';
+import { contactPoint, hurtSeverity, isAttached, isGrounded } from './PlayerSignals';
 
 /**
- * BikeState plus the two monotonic event counters BikePhysics publishes.
+ * PlayerState plus two OPTIONAL monotonic event counters.
  *
- * They live on BikePhysics.BikeStateEx rather than on Contracts.BikeState (that
- * file is the shared spine and is not this subsystem's to edit — see the
- * report), and this module cannot import from `../bike` without creating a
- * dependency the architecture does not want. So the shape is restated here as
- * an OPTIONAL widening: everything still works against a plain BikeState, and
- * where the counters exist they are used in preference to the latched flags.
+ * `PlayerPhysics` does not currently publish these, so what actually runs is
+ * the flag-and-mode-edge path below. The widening is kept because it is the
+ * only correct mechanism if it ever does, and because the reasoning is worth
+ * not having to rediscover:
  *
- * WHY THEY MATTER HERE. `landedThisStep` / `crashedThisStep` are true for
- * exactly one 120 Hz physics step. A rendered frame consumes two of those, so
- * a flag raised and cleared inside one frame is invisible; and the mode-edge
- * fallback below cannot see a crash that begins and resolves between two
- * frames at all. A counter compared against a remembered value is correct for
- * any number of steps per frame, survives two events in one frame, and needs
- * nobody to clear it.
+ * `landedThisStep` / `hurtThisStep` are true for exactly one 120 Hz physics
+ * step. A rendered frame consumes two of those, so a flag raised and cleared
+ * inside one frame is invisible here; and the mode-edge fallback cannot see a
+ * hit that begins and resolves between two frames at all. A counter compared
+ * against a remembered value is correct for any number of steps per frame,
+ * survives two events in one frame, and needs nobody to clear it.
+ *
+ * The landing path is covered either way — `prevAirborne && !airborneNow` is an
+ * edge that survives any frame rate. A hit inside one frame is not, and that is
+ * the case these would fix.
  */
-type EventCounters = { landCount?: number; crashCount?: number };
+type EventCounters = { landCount?: number; hurtCount?: number };
 import { clamp01 } from '../core/MathX';
 import { Rng } from '../core/RNG';
-import { BIKE, SURFACES } from '../game/WorldConstants';
+import { SURFACES } from '../game/WorldConstants';
 import { HUD_PALETTE } from '../npr/Palette';
 
 import { CameraDirector, CAMERA_TUNING, type CameraDirectorOptions } from './CameraDirector';
@@ -84,8 +92,6 @@ const _fallbackPos = new Vector3();
 const _fallbackNrm = new Vector3(0, 1, 0);
 /** Scratch for the one-off smear-rig scene scan. */
 const _scanPos = new Vector3();
-/** Bike wheels spin about their pivot's local X. */
-const _WHEEL_AXIS = new Vector3(1, 0, 0);
 
 /**
  * Used when the physics has not filled in a contact yet (first frame, or a
@@ -100,6 +106,15 @@ const DEFAULT_SURFACE: SurfaceProperties = {
 
 /** Boost ignition flash colour, resolved once. */
 const BOOST_FLASH_HEX = HUD_PALETTE.boost.getHex();
+/**
+ * Default spark colour: the hot end of the gold. Sparks are the one effect in
+ * the game allowed to be brighter than the paper — they are the only thing on
+ * screen that is genuinely incandescent — so this is `goldHot` rather than
+ * `gold`, and it is the colour that carries the grind read at distance.
+ */
+const SPARK_TINT = HUD_PALETTE.goldHot.clone();
+/** Scratch for a caller-supplied spark tint, so an override costs no allocation. */
+const _sparkTint = HUD_PALETTE.goldHot.clone();
 
 export interface EffectsDeps {
   /** The FX object is added to this scene by createEffects. */
@@ -110,10 +125,10 @@ export interface EffectsDeps {
   seed?: number | string;
   dustCapacity?: number;
   debrisCapacity?: number;
-  /** Bike local forward axis, only used as a heading fallback. Default +Z. */
+  /** Character local forward axis, only used as a heading fallback. Default +Z. */
   forwardAxis?: Vector3;
   /**
-   * Derive dust, debris and impact frames from the subject BikeState.
+   * Derive dust, debris and impact frames from the subject PlayerState.
    * Off means every emission is a manual call.
    */
   autoEmit?: boolean;
@@ -130,7 +145,7 @@ export class Effects implements IEffects {
   readonly cameraDirector: CameraDirector;
 
   private rng: Rng;
-  private subject: BikeState | null = null;
+  private subject: PlayerState | null = null;
   private autoEmit: boolean;
   private terrain: ITerrain | null;
 
@@ -142,9 +157,9 @@ export class Effects implements IEffects {
   private prevBoosting = false;
   private landCooldown = 0;
   private crashCooldown = 0;
-  /** Last seen values of the BikeStateEx event counters. -1 = not primed. */
+  /** Last seen values of the optional event counters. -1 = not primed. */
   private seenLandCount = -1;
-  private seenCrashCount = -1;
+  private seenHurtCount = -1;
 
   // ── Crash ground strikes ──────────────────────────────────────────────────
   // A crash is not an instant, it is a process: the bike goes down, tumbles,
@@ -165,8 +180,6 @@ export class Effects implements IEffects {
   private scene: Scene;
   private smearWired = false;
   private smearAttempts = 0;
-  private frontSpin: SpinSmear | null = null;
-  private rearSpin: SpinSmear | null = null;
   private smearTargets: Object3D[] = [];
 
   constructor(deps: EffectsDeps) {
@@ -214,16 +227,16 @@ export class Effects implements IEffects {
 
   // ── Wiring ────────────────────────────────────────────────────────────────
 
-  /** The BikeState everything automatic is derived from. Null outside a race. */
-  setSubject(state: BikeState | null): void {
+  /** The PlayerState everything automatic is derived from. Null outside a race. */
+  setSubject(state: PlayerState | null): void {
     this.subject = state;
     // A new subject invalidates whatever rig we resolved for the old one.
     this.smearWired = false;
     this.smearAttempts = 0;
     this.primeCounters(state);
     if (state) {
-      this.prevAirborne = state.mode === 'airborne';
-      this.prevCrashing = state.mode === 'crashing';
+      this.prevAirborne = state.mode === MoveMode.Airborne;
+      this.prevCrashing = state.mode === MoveMode.Hurt;
       this.prevSpeed = state.speed;
     }
   }
@@ -241,92 +254,70 @@ export class Effects implements IEffects {
    * Adopting HERE, at the reset, makes the baseline mean "everything before
    * this moment is history" and everything after it an event.
    */
-  private primeCounters(state: BikeState | null): void {
-    const ev = state as (BikeState & EventCounters) | null;
+  private primeCounters(state: PlayerState | null): void {
+    const ev = state as (PlayerState & EventCounters) | null;
     this.seenLandCount = typeof ev?.landCount === 'number' ? ev.landCount : -1;
-    this.seenCrashCount = typeof ev?.crashCount === 'number' ? ev.crashCount : -1;
+    this.seenHurtCount = typeof ev?.hurtCount === 'number' ? ev.hurtCount : -1;
   }
 
   /**
    * Find the subject's own meshes and wire the smear systems to them.
    *
-   * This exists because there is a genuine hole in the contracts: BikeState is
-   * pure data — position, velocity, wheel states — and carries no Object3D at
-   * all, while `setSmearTargets` and `addSpinSmear` need scene nodes. Nothing
-   * in the codebase bridged that gap, so SpeedFX's two geometry-smear systems
-   * were fully implemented, fully tested by their own shaders, and called by
-   * absolutely nobody. Wheels were razor-crisp at 78 km/h with a 26" wheel
-   * turning 40 degrees per rendered frame.
+   * This exists because there is a genuine hole in the contracts: PlayerState is
+   * pure data — position, velocity, normals — and carries no Object3D at all,
+   * while `setSmearTargets` needs scene nodes. Nothing in the codebase bridged
+   * that gap, so SpeedFX's geometry-smear system was fully implemented, fully
+   * tested by its own shaders, and called by absolutely nobody.
    *
-   * Rather than require the Game to reach into two subsystems and hand us
-   * their internals, we resolve it here from the scene the facade was already
-   * given. Bikes name their wheel pivots `frontWheel` / `rearWheel` and their
-   * roots `bike:<id>`; rigs name their roots `rider:<id>`. We take the bike
-   * root NEAREST the subject's own position, which needs no id convention at
-   * all and is correct even with five racers on the grid.
+   * Rather than require the Game to reach into another subsystem and hand us its
+   * internals, we resolve it here from the scene the facade was already given.
+   * `Player` names its root `player` and `CharacterRig` names its own group
+   * `character`; the rig is preferred because the limbs are what streak, and the
+   * root is the fallback so a Game that builds the physics without the rig still
+   * smears something.
    *
-   * Retried for a few frames and then given up on: the rig is built during
-   * load and a missed frame is invisible, but an unbounded retry would walk
-   * the whole scene graph every frame forever if a name ever changed.
+   * The nearest candidate to the subject's own position wins, which needs no id
+   * convention at all and stays correct if a ghost or a replay double is ever
+   * added to the scene.
+   *
+   * Retried for a few frames and then given up on: the rig is built during load
+   * and a missed frame is invisible, but an unbounded retry would walk the whole
+   * scene graph every frame forever if a name ever changed.
    */
-  private resolveSmearRig(state: BikeState): void {
+  private resolveSmearRig(state: PlayerState): void {
     this.smearWired = true;
     this.smearAttempts++;
 
     let best: Object3D | null = null;
     let bestD = Infinity;
     this.scene.traverse((o) => {
-      if (!o.name.startsWith('bike:') || o.name.endsWith(':hull')) return;
+      if (o.name !== 'character' && o.name !== 'player') return;
       o.getWorldPosition(_scanPos);
       const d = _scanPos.distanceToSquared(state.position);
-      if (d < bestD) {
+      // A tie goes to the rig: `character` is a child of `player`, so both sit
+      // at the same world point and only one of them holds the limbs.
+      if (d < bestD || (d <= bestD && o.name === 'character')) {
         bestD = d;
         best = o;
       }
     });
 
-    const bikeRoot = best as Object3D | null;
+    const root = best as Object3D | null;
     // Nothing found yet (still loading) — allow a handful of retries.
-    if (!bikeRoot || bestD > 400) {
+    if (!root || bestD > 400) {
       if (this.smearAttempts < 240) this.smearWired = false;
       return;
     }
 
-    const id = bikeRoot.name.slice('bike:'.length);
-    const riderRoot = this.scene.getObjectByName(`rider:${id}`) ?? null;
-
-    // Geometry smear: the rider first (limbs are what streak in a trick), the
-    // bike second. SpeedFX clones at most `maxMeshesPerTarget` meshes each and
-    // only draws them while the smear is actually active.
-    const targets: Object3D[] = [];
-    if (riderRoot) targets.push(riderRoot);
-    targets.push(bikeRoot);
     // Drop any clones built for a previous subject before adopting the new
     // list — SpeedFX caps simultaneous targets, so stale entries would
     // eventually starve the real ones.
+    const targets: Object3D[] = [root];
     for (const old of this.smearTargets) {
       if (!targets.includes(old)) this.speed.release(old);
     }
     this.smearTargets = targets;
     this.setSmearTargets(targets);
-
-    // Wheel spin smear. The wheel pivots spin about their own local X — that
-    // is the axis BikeVisual writes `rotation.x` on — and the radius is the
-    // committed tyre radius, so the annulus lands exactly on the tyre.
-    // Re-ANCHOR an existing handle rather than adding a second one. setSubject
-    // can legitimately be called again (restart, or switching to a replay
-    // rider) and a fresh addSpinSmear each time would leak a draw call per
-    // call and leave the old annulus welded to the previous bike's wheel.
-    const front = bikeRoot.getObjectByName('frontWheel');
-    const rear = bikeRoot.getObjectByName('rearWheel');
-    if (front) {
-      if (this.frontSpin) this.frontSpin.setAnchor(front);
-      else this.frontSpin = this.addSpinSmear(front, BIKE.wheelRadius, _WHEEL_AXIS);
-    }
-    if (rear) {
-      if (this.rearSpin) this.rearSpin.setAnchor(rear);
-      else this.rearSpin = this.addSpinSmear(rear, BIKE.wheelRadius, _WHEEL_AXIS);
-    }
   }
 
   setTerrain(t: ITerrain | null): void {
@@ -340,7 +331,14 @@ export class Effects implements IEffects {
     this.speed.setAutoSmearTargets(objects);
   }
 
-  /** Register a wheel for radial spin smear. See SpeedFX.addSpinSmear. */
+  /**
+   * Register a rotating part for radial spin smear. See SpeedFX.addSpinSmear.
+   *
+   * The bike wired its two wheels to this automatically. The character has no
+   * continuously spinning part, so nothing calls it now — it is kept because the
+   * system behind it is complete and a boss's rotor or a set-piece turbine is
+   * exactly what it is for.
+   */
   addSpinSmear(anchor: Object3D, radius: number, axis: Vector3): SpinSmear {
     return this.speed.addSpinSmear(anchor, radius, axis);
   }
@@ -436,7 +434,6 @@ export class Effects implements IEffects {
 
     if (s && this.autoEmit) {
       if (!this.smearWired) this.resolveSmearRig(s);
-      this.driveSpinSmear(s);
       this.detectEvents(s, rd);
       if (dt > 0) this.emitFromState(s, dt);
     }
@@ -448,68 +445,54 @@ export class Effects implements IEffects {
 
   // ── Automatic emission ────────────────────────────────────────────────────
 
-  /**
-   * Push this frame's wheel speeds into the spin smears.
-   *
-   * BikeState already carries `spinRate` per wheel in rad/s, so nothing has to
-   * be differenced or guessed — and it is the PHYSICAL rate, which is what the
-   * effect must key off. At 78 km/h a 0.33 m wheel turns 65 rad/s: 62 degrees
-   * per rendered frame, far past the point where a spoke pattern can be
-   * sampled without strobing, which is exactly the regime the annulus is for.
-   */
-  private driveSpinSmear(s: BikeState): void {
-    if (this.frontSpin) this.frontSpin.setSpin(s.front?.spinRate ?? 0);
-    if (this.rearSpin) this.rearSpin.setSpin(s.rear?.spinRate ?? 0);
-  }
-
-  private detectEvents(s: BikeState, dt: number): void {
+  private detectEvents(s: PlayerState, dt: number): void {
     if (this.landCooldown > 0) this.landCooldown -= dt;
     if (this.crashCooldown > 0) this.crashCooldown -= dt;
     if (this.crashStrikeCooldown > 0) this.crashStrikeCooldown -= dt;
 
-    const airborneNow = s.mode === BikeMode.Airborne;
-    const crashingNow = s.mode === BikeMode.Crashing;
+    const airborneNow = s.mode === MoveMode.Airborne;
+    const hurtNow = s.mode === MoveMode.Hurt;
 
     // ── Counters first, flags as the fallback ─────────────────────────────────
-    const ev = s as BikeState & EventCounters;
+    const ev = s as PlayerState & EventCounters;
     let landed: boolean;
-    let crashed: boolean;
-    if (typeof ev.landCount === 'number' && typeof ev.crashCount === 'number') {
+    let hurt: boolean;
+    if (typeof ev.landCount === 'number' && typeof ev.hurtCount === 'number') {
       if (this.seenLandCount < 0) {
         // Never primed (no reset, no setSubject). Adopt rather than replay: the
-        // counters are monotonic across a whole race and a fresh consumer must
+        // counters are monotonic across a whole run and a fresh consumer must
         // not fire an effect for every landing that already happened.
         this.seenLandCount = ev.landCount;
-        this.seenCrashCount = ev.crashCount;
+        this.seenHurtCount = ev.hurtCount;
       }
       landed = ev.landCount > this.seenLandCount;
-      crashed = ev.crashCount > this.seenCrashCount;
+      hurt = ev.hurtCount > this.seenHurtCount;
       this.seenLandCount = ev.landCount;
-      this.seenCrashCount = ev.crashCount;
+      this.seenHurtCount = ev.hurtCount;
     } else {
-      landed = s.landedThisStep || (this.prevAirborne && !airborneNow && !crashingNow);
-      crashed = s.crashedThisStep || (!this.prevCrashing && crashingNow);
+      landed = s.landedThisStep || (this.prevAirborne && !airborneNow && !hurtNow);
+      hurt = s.hurtThisStep || (!this.prevCrashing && hurtNow);
     }
 
-    if (landed && !crashingNow && this.landCooldown <= 0) {
+    if (landed && !hurtNow && this.landCooldown <= 0) {
       this.landCooldown = 0.08;
       this.notifyLanding(s);
     }
 
-    if (crashed && this.crashCooldown <= 0) {
+    if (hurt && this.crashCooldown <= 0) {
       this.crashCooldown = 0.40;
-      this.notifyCrash(s);
+      this.notifyHurt(s);
     }
 
-    // ── The rest of the crash ─────────────────────────────────────────────────
-    // Everything above fires once, on the frame the bike goes down. What the
-    // audience actually watches is the second and a half AFTER that, and until
-    // now none of it was drawn: the review capture of `crash` measured zero
-    // live puffs across the entire window in which the speedo falls from 19 to
-    // 9 km/h, and its only flash belonged to a rival colliding with the downed
-    // player 900 ms later. A body sliding across a rock garden throws material
-    // continuously and bangs down two or three times on the way to a stop.
-    if (crashingNow) this.crashStrikes(s, dt);
+    // ── The rest of the hit ───────────────────────────────────────────────────
+    // Everything above fires once, on the frame the body goes down. What the
+    // audience actually watches is the second that follows, and until the bike
+    // version of this was written none of it was drawn: a capture of a crash
+    // measured zero live puffs across the entire window in which the speed fell
+    // from 19 to 9 km/h. A body tumbling across a rock garden throws material
+    // continuously and bangs down two or three times on the way to a stop, and
+    // a stunned character knocked 28 m/s backwards does exactly the same.
+    if (hurtNow) this.hurtStrikes(s, dt);
     this.prevSpeed = s.speed;
 
     // Boost ignition gets a flash but never a freeze — it happens far too
@@ -518,33 +501,30 @@ export class Effects implements IEffects {
     this.prevBoosting = s.boosting;
 
     this.prevAirborne = airborneNow;
-    this.prevCrashing = crashingNow;
+    this.prevCrashing = hurtNow;
   }
 
   /**
-   * Dust and punctuation for the body of a crash.
+   * Dust and punctuation for the body of a hit.
    *
    * Two signals, both derived from state that already exists:
    *
-   *  • A STRIKE is a wheel or the frame arriving back on the ground — either a
-   *    contact rising edge, or a single-frame loss of speed too large to be
-   *    friction. Measured on `crash`, the hard one is at f0027-f0028 where the
-   *    speedo drops 15.6 to 8.9 km/h in 16 ms; that is the frame the eye reads
-   *    as the hit, and it is squarely inside the f0005-f0030 window the critic
-   *    identified and the old code left empty.
+   *  • A STRIKE is the body arriving back on the ground — either a contact
+   *    rising edge, or a single-frame loss of speed too large to be friction.
+   *    That is the frame the eye reads as the hit, and it is the window the old
+   *    entry-only code left empty.
    *
-   *  • A SLIDE throws a continuous trail while the wreck is anywhere near the
-   *    ground, whether or not the physics calls a wheel grounded — during a
-   *    tumble it usually does not, and "no wheel is technically in contact" is
-   *    not a reason for a bike scraping along at 20 km/h to be dustless.
+   *  • A SLIDE throws a continuous trail while the body is anywhere near the
+   *    ground, whether or not the physics calls it grounded — during a tumble it
+   *    usually does not, and "no contact is technically registered" is not a
+   *    reason for a body scraping along at 20 km/h to be dustless.
    */
-  private crashStrikes(s: BikeState, dt: number): void {
-    const w = s.rear?.grounded ? s.rear : s.front;
-    const surf = w?.surface ?? DEFAULT_SURFACE;
-    const nrm = w?.contactNormal ?? _fallbackNrm;
-    const pos = this.contactOrFallback(w, s);
+  private hurtStrikes(s: PlayerState, dt: number): void {
+    const surf = s.surface ?? DEFAULT_SURFACE;
+    const nrm = s.groundNormal.lengthSq() > 1e-6 ? s.groundNormal : _fallbackNrm;
+    const pos = contactPoint(s, this.terrain, _fallbackPos);
 
-    const contact = !!(s.rear?.grounded || s.front?.grounded);
+    const contact = isAttached(s);
     const drop = this.prevSpeed - s.speed;
     // 6 m/s² of friction over a 60 Hz frame is 0.1 m/s. Anything four times
     // that in one frame is the ground arriving, not the ground rubbing.
@@ -555,183 +535,156 @@ export class Effects implements IEffects {
     if (struck && this.crashStrikeCooldown <= 0) {
       this.crashStrikeCooldown = 0.12;
       const force = clamp01(0.30 + drop * 0.9 + s.speed * 0.035);
-      // CRASH DUST IGNORES A STINGY SURFACE. `crash` is staged in the rock
-      // garden, dustAmount 0.18, which turned a 16-puff impact into three.
-      // 0.85 rather than 0.62: the hit is the one moment in the whole sequence
-      // the audience is looking at, and at the new mark size 0.62 buys sixteen
-      // puffs where the read needs about twenty-five.
+      // IMPACT DUST IGNORES A STINGY SURFACE. A hit staged in the rock garden,
+      // dustAmount 0.18, turns a 16-puff impact into three. 0.85 rather than
+      // 0.62: the hit is the one moment in the whole sequence the audience is
+      // looking at, and at this mark size 0.62 buys sixteen puffs where the
+      // read needs about twenty-five.
       this.dust.burst(pos, nrm, s.velocity, 0.55 + force * 0.45, surf, 0.85);
       this.debris.screeSpray(pos, nrm, s.velocity, force * 0.7, surf);
-      // Flash only — the freeze belongs to the crash's own entry, and stopping
-      // the world three times inside one tumble is a stutter, not punctuation.
-      // Two frames for a real bang, one for a scuff: the same 33 ms punch a
-      // motion review measured as correct, landing on the frame the body
-      // actually arrives rather than on the frame the solver changed mode.
+      // Flash only — the freeze belongs to the hit's own entry, and stopping the
+      // world three times inside one tumble is a stutter, not punctuation. Two
+      // frames for a real bang, one for a scuff.
       if (force > 0.34) this.impact.flashOnly(0.30 + force * 0.55, undefined, force > 0.55 ? 2 : 1);
     }
 
-    // The slide. Gated on height above the ground rather than on `grounded`.
+    // The slide. Gated on height above the ground rather than on contact.
     if (s.airHeight < 1.4 && s.speed > 1.2) {
       this.dust.trail(pos, nrm, s.velocity, 40 + s.speed * 9, dt, surf, 0.70);
     }
   }
 
-  private emitFromState(s: BikeState, dt: number): void {
-    // The rear wheel does most of the visible work — it carries the drive, it
-    // locks first under braking, and it is the one the camera is looking at.
-    this.emitWheel(s.rear, s, dt, 1.0);
-    this.emitWheel(s.front, s, dt, 0.58);
+  /**
+   * The steady-state emission: what the feet are doing to the ground.
+   *
+   * WHAT REPLACED THE WHEELS. The bike ran this off two contacts with a load, a
+   * slip ratio and a lateral slip each, and the rate was a sum of a rolling term
+   * and a skid term. The character has one contact and none of those channels,
+   * so the two terms are rebuilt from what a runner actually has:
+   *
+   *  • ROLLING becomes the footfall term — material thrown by feet pushing off,
+   *    scaled by ground speed.
+   *  • SKID becomes the slide term — `Sliding` is the mode that drags a whole
+   *    body across the surface, and it is the only one that earns the old
+   *    locked-wheel rates.
+   *
+   * `Grinding` and `WallRun` emit nothing here on purpose: the character is on a
+   * rail or a wall, and the mountain under it is not being touched. The rail's
+   * own sparks are the physics layer's call, through `sparkBurst`.
+   */
+  private emitFromState(s: PlayerState, dt: number): void {
+    const grounded = isGrounded(s);
+    const sliding = s.mode === MoveMode.Sliding;
+    const surf = s.surface ?? DEFAULT_SURFACE;
+    const nrm = s.groundNormal.lengthSq() > 1e-6 ? s.groundNormal : _fallbackNrm;
+
+    if (grounded) {
+      const pos = contactPoint(s, this.terrain, _fallbackPos);
+      this.emitFeet(pos, nrm, surf, s, sliding, dt);
+      return;
+    }
 
     // ── THE SKIM ──────────────────────────────────────────────────────────────
     //
     // `grounded` is a solver predicate, not a photograph. Down anything rough
-    // the bike spends a large fraction of its frames with both wheels a few
-    // centimetres clear — the DustSystem's own header already notes the trail
-    // was being cut to a third for exactly this reason — and a tyre 60 mm off
-    // scree at 20 m/s is still dragging a wake through loose material. Gating
-    // the whole effect on a boolean that chatters at 120 Hz is what makes the
-    // tail read as intermittent.
+    // the character spends a large fraction of its frames a few centimetres
+    // clear, and feet 60 mm off scree at 20 m/s are still dragging a wake
+    // through loose material. Gating the whole effect on a boolean that chatters
+    // at 120 Hz is what makes the tail read as intermittent.
     //
-    // It is also the entire reason `scree-speed` f0000 is a rider at 70 km/h
-    // with ZERO dust anywhere in frame: the capture teleports the bike, the
-    // suspension has not settled, neither wheel reports contact on the shutter
-    // frame, and the first still of the sequence therefore has no effect in it
-    // at all.
+    // It is also why the first still of a fast capture is a character at 70 km/h
+    // with ZERO dust anywhere in frame: the harness teleports the player, the
+    // ground probe has not settled, no contact is reported on the shutter frame.
     //
-    // So: below a wheel radius of clearance, at a speed worth drawing, emit a
-    // reduced trail from the ground under the bike. Nothing new is remembered —
-    // the height and the terrain are both already in hand — so there is no
-    // state here for Game.applySituation's effects.reset() to have to wipe.
-    const airborneSkim = !(s.rear?.grounded || s.front?.grounded);
-    if (airborneSkim && s.airHeight < 0.30 && s.speed > 5 && s.mode !== BikeMode.Crashing) {
-      const w = s.rear ?? s.front;
-      const surf = w?.surface ?? DEFAULT_SURFACE;
-      const nrm = w?.contactNormal ?? _fallbackNrm;
-      const pos = this.contactOrFallback(undefined, s);
+    // So: below a stride of clearance, at a speed worth drawing, emit a reduced
+    // trail from the ground under the character. Nothing new is remembered — the
+    // height and the terrain are both already in hand — so there is no state
+    // here for `Game.applySituation`'s `effects.reset()` to have to wipe.
+    if (
+      s.airHeight < 0.30 &&
+      s.speed > 5 &&
+      s.mode !== MoveMode.Hurt &&
+      s.mode !== MoveMode.Grinding &&
+      s.mode !== MoveMode.WallRun
+    ) {
+      const pos = contactPoint(s, this.terrain, _fallbackPos);
       const near = clamp01(1 - s.airHeight / 0.30);
       this.dust.trail(pos, nrm, s.velocity, clamp01((s.speed - 4) / 14) * 95 * near, dt, surf);
     }
   }
 
-  private emitWheel(w: WheelState, s: BikeState, dt: number, weight: number): void {
-    if (!w || !w.grounded) return;
-    const surf = w.surface ?? DEFAULT_SURFACE;
-    const pos = w.contactPoint ?? s.position;
-    const nrm = w.contactNormal ?? _fallbackNrm;
-
-    const slip = Math.abs(w.lateralSlip ?? 0);
-    const ratio = w.slipRatio ?? 0;
-    const lock = clamp01(-ratio);
-    const spinUp = clamp01(ratio);
-    // Load normalised against roughly a single wheel's share of static weight,
-    // so a wheel that has gone light through a compression stops throwing dust.
-    const load01 = clamp01((w.load ?? 0) / (BIKE.mass * BIKE.gravity * 0.75));
-
-    // Rolling contribution.
-    //
-    // SIZING THIS PROPERLY IS THE WHOLE EFFECT, and the old numbers were out by
-    // most of an order of magnitude. The formula topped out around 10 puffs a
-    // second; the course is ridden on the groomed ribbon whose dustAmount is
-    // 0.55, so ~6 reached the emitter; the bike is airborne roughly two frames
-    // in three down anything rough, so ~2/s actually landed; at a ~0.9 s life
-    // that is TWO live puffs behind the rider. No amount of shader work makes
-    // two puffs into a dust tail.
-    //
-    // What a tail has to be, geometrically: at 19 m/s a 0.9 s puff is 17 m
-    // behind the wheel by the time it dies, so a continuous ribbon of ~0.5 m
-    // puffs needs 35-60 of them alive at once. That, not a feeling, is where
-    // the base rate comes from — and it is why the cap below exists, because
-    // the same formula under a full lock-up would otherwise ask for 400/s and
-    // bury the rider in his own dust.
+  private emitFeet(
+    pos: Vector3,
+    nrm: Vector3,
+    surf: SurfaceProperties,
+    s: PlayerState,
+    sliding: boolean,
+    dt: number,
+  ): void {
     // ── PUFFS PER METRE, NOT PER SECOND ───────────────────────────────────────
     //
-    // The rolling term used to saturate: clamp01((speed - 3) / 13) is flat from
-    // 16 m/s upward. Emission is then a constant number of marks per SECOND
-    // while the wheel that lays them down covers ever more ground per second, so
-    // the spacing between consecutive puffs grows in direct proportion to speed
-    // and the trail gets THINNER the faster you go. Measured on scree-speed at
-    // 83 km/h: 172 live puffs strung over 34 m, five per metre of marks 0.3 m
-    // across — a dotted line. The same emitter at 17 km/h piles the same marks
-    // 0.05 m apart and reads as a wall. One number cannot be right for both
-    // because the wrong quantity is being held constant.
+    // Emission authored as a constant number of marks per SECOND, by a contact
+    // that covers ever more ground per second, spaces consecutive puffs in
+    // direct proportion to speed — so the trail gets THINNER the faster you go.
+    // Measured on the bike at 83 km/h: 172 live puffs strung over 34 m, five per
+    // metre of marks 0.3 m across, a dotted line. The same emitter at 17 km/h
+    // piled the same marks 0.05 m apart and read as a wall. One number cannot be
+    // right for both because the wrong quantity is being held constant.
     //
-    // Linear density is what the eye actually reads, so that is what is
-    // authored: puffs per metre of travel, converted to a rate by multiplying
-    // by speed. 9.0 is chosen against the ribbon the course is really ridden on
-    // (dustAmount 0.55) and the two wheels' weights (1.0 + 0.58), and lands
-    // about 7 marks per metre at every speed — spacing 0.14 m against puffs
-    // 0.22-0.99 m across, which is the overlap that makes separate contours one
-    // silhouette. The fade-in below 2.5 m/s keeps a bike at walking pace clean.
+    // Linear density is what the eye reads, so that is what is authored: puffs
+    // per metre of travel, converted to a rate by multiplying by speed.
     //
     // AND THE NUMBER IS SET BY WHAT THE CHASE CAMERA CAN SEE, NOT BY THE LENGTH
-    // OF THE TRAIL. The boom sits ~4.8 m behind the bike looking forward, so of
-    // a plume streaming 33 m the frame contains only the first four metres of
-    // it — everything older is behind the lens. countAlive() said 213 and the
-    // still contained about a dozen marks, and both are right: 213 puffs over
-    // 33 m is 6.4 per metre, and 6.4 per metre across the 4 m strip the camera
-    // can actually see is nineteen. A density authored against the whole trail
-    // is authored against a length nobody is looking down. 18 puts ~11 marks on
-    // every metre of the visible strip, which at 0.09 m spacing and 0.33-0.51 m
-    // marks is continuous rather than dotted.
-    const perMetre = 18.0 * clamp01((s.speed - 2.5) / 6.5);
-    const roll = perMetre * s.speed;
-    const skid = clamp01(slip / 5.5) + lock * 0.75 + spinUp * 0.5;
+    // OF THE TRAIL. The boom sits a few metres behind looking forward, so of a
+    // plume streaming 33 m the frame contains only the first few metres of it —
+    // everything older is behind the lens. A density authored against the whole
+    // trail is authored against a length nobody is looking down. 18 puts ~11
+    // marks on every metre of the visible strip, which at 0.09 m spacing and
+    // 0.33-0.51 m marks is continuous rather than dotted.
+    //
+    // The fade-in below 2.5 m/s keeps a character at walking pace clean. Note
+    // this is GROUND speed: the vertical channel is the ground-stick velocity
+    // while grounded and has nothing to do with what the feet scuff up.
+    const perMetre = 18.0 * clamp01((s.groundSpeed - 2.5) / 6.5);
+    const roll = perMetre * s.groundSpeed;
+
+    // The slide term. A body dragged along the ground throws material at a rate
+    // set by how hard it is being dragged rather than by how far it has
+    // travelled, so unlike the footfall term this is authored per second.
+    const skid = sliding ? clamp01(s.groundSpeed / 22) : 0;
+
     const isWater = surf.kind === SurfaceKind.Water;
     // Water carries its read in droplets, not in airborne particulate, so the
     // dust channel is cut right back there and the splash below does the work.
     // Left at full rate, water's 1.8 dustAmount made it the single dustiest
     // surface on the mountain, which is the opposite of true.
-    //
-    // The base was 88, and on the surface the course is actually ridden on —
-    // the groomed ribbon, dustAmount 0.55 — that resolves to 68 puffs/s across
-    // both wheels. At the ribbon's ~1.2 s skid life that is 62 live puffs,
-    // which is what countAlive() measures on `scree-speed`, and 62 marks spread
-    // over the 27 m a 1.2 s puff falls behind at 23 m/s is three per metre of a
-    // trail that is supposed to read as continuous. 130 puts it at ~100, which
-    // is where the overlapping contours start being one shape.
-    //
-    // The rolling term is now already a rate (see perMetre above); the skid term
-    // is still authored per second, because a locked wheel throws material at a
-    // rate set by how hard it is being dragged rather than by how far it has
-    // travelled. The cap is what stops a full lock-up asking for 900/s and
-    // burying the rider in his own dust.
-    //
-    // The water factor moves with the base. 0.20 was set against a base that
-    // resolved to ~45 effective puffs/s through water's 1.8 dustAmount; the
-    // per-metre rate resolves to ~99, and a wheel through the stream bed
-    // throwing twice as much airborne particulate is the "dust cloud rising off
-    // a river" this factor exists to prevent. 0.09 holds the absolute quantity
-    // where it was measured to be right and leaves the read to DebrisSystem's
-    // actual droplets.
-    const rate = Math.min((roll + skid * 240) * weight * (0.35 + load01 * 0.9), 460 * weight)
-      * (isWater ? 0.09 : 1);
+    const rate = Math.min(roll + skid * 240, 460) * (isWater ? 0.09 : 1);
     if (rate > 0.5) this.dust.trail(pos, nrm, s.velocity, rate, dt, surf);
 
     if (isWater) {
-      if (s.speed > 2.5 && this.rng.next() < clamp01(dt * (4 + s.speed * 0.7))) {
-        this.debris.splash(pos, nrm, s.velocity, clamp01(0.25 + s.speed / 22) * weight);
+      if (s.groundSpeed > 2.5 && this.rng.next() < clamp01(dt * (4 + s.groundSpeed * 0.7))) {
+        this.debris.splash(pos, nrm, s.velocity, clamp01(0.25 + s.groundSpeed / 22));
       }
     } else if (skid > 0.30 && surf.dustAmount > 0.45) {
       // Gravel is gated stochastically rather than accumulated, so it stays
-      // correct in expectation without needing per-wheel carry state.
+      // correct in expectation without needing per-frame carry state.
       if (this.rng.next() < clamp01(skid * dt * 7)) {
-        this.debris.screeSpray(pos, nrm, s.velocity, clamp01(skid * 0.55) * weight, surf);
+        this.debris.screeSpray(pos, nrm, s.velocity, clamp01(skid * 0.55), surf);
       }
     }
   }
 
   /** Public so a caller with exact physics-step timing can drive it instead. */
-  notifyLanding(s: BikeState): void {
+  notifyLanding(s: PlayerState): void {
     const impact = clamp01(s.landingImpact);
-    const w = s.rear?.grounded ? s.rear : s.front;
-    const surf = w?.surface ?? DEFAULT_SURFACE;
-    const pos = this.contactOrFallback(w, s);
-    const nrm = w?.contactNormal ?? _fallbackNrm;
+    const surf = s.surface ?? DEFAULT_SURFACE;
+    const pos = contactPoint(s, this.terrain, _fallbackPos);
+    const nrm = s.groundNormal.lengthSq() > 1e-6 ? s.groundNormal : _fallbackNrm;
 
     // Landings always throw dust, even a soft one — the dust is the read that
-    // the wheels touched. Only the SIZE tracks the impact. The 0.45 floor
-    // means a landing on rock still throws something: the surface decides how
-    // MUCH material is loose, not whether a 90 kg impact disturbs any.
+    // the feet touched. Only the SIZE tracks the impact. The 0.45 floor means a
+    // landing on rock still throws something: the surface decides how MUCH
+    // material is loose, not whether an 80 kg impact disturbs any.
     this.dust.burst(pos, nrm, s.velocity, Math.max(impact, 0.58), surf, 0.45);
     if (impact > 0.12) this.debris.screeSpray(pos, nrm, s.velocity, impact * 0.85, surf);
     if (surf.kind === SurfaceKind.Water) {
@@ -740,29 +693,29 @@ export class Effects implements IEffects {
     this.impact.trigger(impact);
   }
 
-  notifyCrash(s: BikeState): void {
-    const sev = clamp01(s.crashSeverity || 0.6);
-    const w = s.rear?.grounded ? s.rear : s.front;
-    const surf = w?.surface ?? DEFAULT_SURFACE;
-    const pos = this.contactOrFallback(w, s);
-    const nrm = w?.contactNormal ?? _fallbackNrm;
+  /**
+   * The character taking damage. Was `notifyCrash`.
+   *
+   * Severity is reconstructed rather than read: the player physics publishes a
+   * mode and a health count where the bike published a `crashSeverity`. See
+   * `hurtSeverity`.
+   */
+  notifyHurt(s: PlayerState): void {
+    const sev = hurtSeverity(s);
+    const surf = s.surface ?? DEFAULT_SURFACE;
+    const pos = contactPoint(s, this.terrain, _fallbackPos);
+    const nrm = s.groundNormal.lengthSq() > 1e-6 ? s.groundNormal : _fallbackNrm;
 
     this.dust.burst(pos, nrm, s.velocity, 0.85 + sev * 0.15, surf, 0.70);
-    this.debris.crashDebris(pos, s.velocity, s.crashDirection, sev, surf);
+    // `hurtDirection` is the axis the knockback travels, so it is already the
+    // direction the debris should be thrown.
+    this.debris.crashDebris(pos, s.velocity, s.hurtDirection, sev, surf);
     this.impact.trigger(0.45 + sev * 0.55, undefined, true);
     // Arm the strike tracker so the first frame of the tumble does not read as
     // a fresh contact and fire a second burst on top of this one.
-    this.prevContact = !!(s.rear?.grounded || s.front?.grounded);
+    this.prevContact = isAttached(s);
     this.prevSpeed = s.speed;
     this.crashStrikeCooldown = 0.16;
-  }
-
-  private contactOrFallback(w: WheelState | undefined, s: BikeState): Vector3 {
-    const p = w?.contactPoint;
-    if (p && Number.isFinite(p.x) && (p.lengthSq() > 1e-6 || s.position.lengthSq() < 1e-6)) return p;
-    _fallbackPos.copy(s.position);
-    if (this.terrain) _fallbackPos.y = this.terrain.heightAt(s.position.x, s.position.z);
-    return _fallbackPos;
   }
 
   // ── IEffects ──────────────────────────────────────────────────────────────
@@ -794,8 +747,37 @@ export class Effects implements IEffects {
     this.dust.trail(position, normal, velocity, rate, 1 / 60, surface ?? DEFAULT_SURFACE);
   }
 
+  /**
+   * IEffects. Sparks off a rail, a wall or a parried hit.
+   *
+   * The physics layer calls this directly — see `PlayerPhysics`, which fires one
+   * on a homing connect — so it must be safe at 120 Hz. It is: `DebrisSystem`
+   * caps the count, culls by distance, and recycles from a fixed ring.
+   */
+  sparkBurst(position: Vector3, direction: Vector3, amount: number, tint?: number): void {
+    let c = SPARK_TINT;
+    if (tint !== undefined) {
+      _sparkTint.setHex(tint);
+      c = _sparkTint;
+    }
+    this.debris.sparks(position, direction, amount, c);
+  }
+
   impactFrame(intensity: number, tint?: number): void {
     this.impact.trigger(intensity, tint);
+  }
+
+  /**
+   * IEffects. Brief time dilation.
+   *
+   * Delegated to the camera director, which owns the slow-motion envelope
+   * because it is the thing that also has to decide when the automatic big-air
+   * hold fires — two independent owners of the clock would fight. The facade's
+   * `timeScale` is the minimum of that and the impact freeze, so this shows up
+   * in `beginFrame`'s scaled dt on the very next frame.
+   */
+  slowMotion(scale: number, duration: number): void {
+    this.cameraDirector.slowMotion(scale, duration);
   }
 
   smear(target: Object3D, amount: number): void {

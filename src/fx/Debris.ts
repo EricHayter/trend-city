@@ -57,6 +57,7 @@ const _UP_BIAS = new Vector3(0, 0.55, 0);
 export const DEBRIS_SCREE = 0;
 export const DEBRIS_SPLASH = 1;
 export const DEBRIS_CRASH = 2;
+export const DEBRIS_SPARK = 3;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Chip atlas — four drawn silhouettes, generated once.
@@ -342,6 +343,11 @@ const PROFILES: KindProfile[] = [
   { drag: 2.10, restitution: 0.0, friction: 0.0, maxBounces: 0, dieOnContact: true, stretch: 0.7, tiles: [3, 3, 0] },
   // Crash wreckage: heavier, bouncier, tumbling rather than streaking.
   { drag: 0.22, restitution: 0.44, friction: 0.72, maxBounces: 4, dieOnContact: false, stretch: 0.0, tiles: [1, 2, 2] },
+  // Sparks: a grind or a parry. Nearly ballistic, never bounces, dies the moment
+  // it touches anything, and fully stretched — a spark IS its own streak, and
+  // drawing it as a round chip is what would make it read as gravel with the
+  // wrong colour on it. The long shard tile in every slot, for the same reason.
+  { drag: 0.10, restitution: 0.0, friction: 0.0, maxBounces: 0, dieOnContact: true, stretch: 1.0, tiles: [1, 1, 1] },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -784,6 +790,47 @@ export class DebrisSystem {
       const size = this.rng.range(0.09, 0.26);
       const life = this.rng.range(1.6, 3.2);
       this.spawn(_p.x, _p.y, _p.z, _d.x, _d.y, _d.z, DEBRIS_CRASH, size, life, this.rng.signed() * 13, tint);
+    }
+  }
+
+  /**
+   * Sparks off a rail, a wall or a parried hit.
+   *
+   * `direction` is the axis they are thrown along — the rail tangent, or the
+   * bearing of the hit. It is a CONE about that axis rather than a fan in a
+   * plane: the plane version needs a surface normal to orient itself and the
+   * physics does not always have one to give (a parry has no surface at all).
+   *
+   * Deliberately short-lived and small in count. Sparks are punctuation, and a
+   * hundred of them living a second each is a firework.
+   */
+  sparks(position: Vector3, direction: Vector3, amount: number, tint: Color): void {
+    const a = clamp01(amount);
+    if (a <= 0.02) return;
+    if (this.tooFar(position.x, position.y, position.z)) return;
+
+    const count = clamp(Math.round(3 + a * 13), 2, 18);
+
+    _n.copy(direction);
+    if (_n.lengthSq() < 1e-6) _n.set(0, 1, 0);
+    else _n.normalize();
+    this.basis(_n);
+
+    for (let i = 0; i < count; i++) {
+      const ang = this.rng.range(0, Math.PI * 2);
+      // Half-angle of the cone. Tight enough that the throw reads as directional.
+      const spread = this.rng.range(0, 0.55);
+      _d.copy(_n)
+        .addScaledVector(_t, Math.cos(ang) * spread)
+        .addScaledVector(_b, Math.sin(ang) * spread);
+      _d.normalize().multiplyScalar((6 + a * 16) * this.rng.range(0.55, 1.45));
+      // A touch of lift so they arc off the surface rather than skidding along it.
+      _d.y += this.rng.range(0.5, 3.0);
+
+      _p.copy(position);
+      const size = this.rng.range(0.035, 0.10);
+      const life = this.rng.range(0.10, 0.26);
+      this.spawn(_p.x, _p.y, _p.z, _d.x, _d.y, _d.z, DEBRIS_SPARK, size, life, 0, tint);
     }
   }
 

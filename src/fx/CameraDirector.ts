@@ -138,14 +138,15 @@
 import { Object3D, PerspectiveCamera, Quaternion, Vector3 } from 'three';
 
 import {
-  BikeMode,
+  MoveMode,
   CameraMode,
-  type BikeState,
+  type PlayerState,
   type ICameraDirector,
   type IReplayRecorder,
   type ITerrain,
   type ReplayFrame,
 } from '../game/Contracts';
+import { YawRateTracker, hurtSeverity, isAttached } from './PlayerSignals';
 import {
   DEG,
   clamp,
@@ -183,6 +184,8 @@ const _pivot = new Vector3();
 const _boomDir = new Vector3();
 const _probe = new Vector3();
 const _view = new Vector3();
+/** Owned by the view-yaw read at the end of compose(). Not shared with _view. */
+const _viewDir = new Vector3();
 const _qa = new Quaternion();
 const _qb = new Quaternion();
 const UP = new Vector3(0, 1, 0);
@@ -297,7 +300,7 @@ export const CAMERA_TUNING = {
    */
   chaseHeight: 2.3,
   chaseHeightSpeedGain: -0.18,
-  /** Height above BikeState.position that the boom pivots on — the chest. */
+  /** Height above PlayerState.position that the boom pivots on — the chest. */
   subjectPivotHeight: 0.95,
 
   /** Position spring: under-damped, which is where the whip comes from. */
@@ -527,7 +530,7 @@ export const CAMERA_TUNING = {
    * three-quarter, which still reads as a rider on a mountain.
    */
   boomMaxRise: 0.72,
-  /** Height of a rider's head above their BikeState.position. */
+  /** Height of a rider's head above their PlayerState.position. */
   riderTop: 1.75,
 
   /**
@@ -719,7 +722,7 @@ export const CAMERA_TUNING = {
   safeInnerPad: 0.045,
   /**
    * The subject box the framing loop measures, metres above and below
-   * `BikeState.position`. NOT the collision extents and not `riderTop`.
+   * `PlayerState.position`. NOT the collision extents and not `riderTop`.
    *
    * It used to measure +1.75 / −0.48, and both ends were wrong in the same
    * direction: the drawn silhouette's centre sits about 0.05 of frame height
@@ -740,7 +743,7 @@ export const CAMERA_TUNING = {
    * feeding the standing box to the framing loop during one is how `crash`
    * ended up with the bike below the frame edge while the controller reported
    * itself satisfied. Measured off the shipped `crash` f0056: the drawn wreck
-   * ran from about +0.70 down to about −1.05 of `BikeState.position`, a box
+   * ran from about +0.70 down to about −1.05 of `PlayerState.position`, a box
    * whose centre is 0.63 m BELOW the centre of the standing one — which at that
    * shot's 4.2 m and 55 degrees is 0.145 of frame height, 130 px of subject
    * pushed toward the bottom edge. The loop was not failing; it was being told
@@ -860,7 +863,7 @@ export const CAMERA_TUNING = {
   /**
    * THERE IS NO CRASH AIM OFFSET, and there was one for about an hour.
    *
-   * 1.1 m above `BikeState.position` is a rider's chest when they are on a bike
+   * 1.1 m above `PlayerState.position` is a rider's chest when they are on a bike
    * and half a metre of empty air above a rider who is on their back, so
    * dropping the aim during a wreck looks like the obvious fix and it measures
    * beautifully — right up until you look at the frame. Lowering the aim lowers
@@ -902,7 +905,7 @@ export const CAMERA_TUNING = {
   collisionMargin: 1.15,
 } as const;
 
-function estimateAirRemaining(t: BikeState): number {
+function estimateAirRemaining(t: PlayerState): number {
   // Ballistic time to return to the ground directly below, from the current
   // vertical velocity and height. Cheap, and good enough that the swing knows
   // when to start coming home.
@@ -929,10 +932,10 @@ export interface CameraDirectorOptions {
    */
   forwardAxis?: Vector3;
   rng?: Rng;
-  /** Detect landings/crashes from BikeState itself. Off if you drive them. */
+  /** Detect landings/crashes from PlayerState itself. Off if you drive them. */
   autoDetectEvents?: boolean;
   /** Other riders the boom must not collide with. See `setOccluders`. */
-  occluders?: readonly BikeState[];
+  occluders?: readonly PlayerState[];
 }
 
 export class CameraDirector implements ICameraDirector {
@@ -943,7 +946,16 @@ export class CameraDirector implements ICameraDirector {
   timeScale = 1;
 
   /** Last state passed to update(). Null before the first frame. */
-  subject: BikeState | null = null;
+  subject: PlayerState | null = null;
+
+  /**
+   * ICameraDirector. The heading the player's move input is relative to,
+   * radians, atan2(x, z) — the same convention `PlayerState.facing` uses, so
+   * `PlayerInput.cameraYaw` can be fed this value directly.
+   */
+  get yaw(): number {
+    return this.viewYaw;
+  }
 
   private terrain: ITerrain | null;
   private forwardAxis: Vector3;
@@ -975,6 +987,26 @@ export class CameraDirector implements ICameraDirector {
   private yawRate = 0;
   private roll = 0;
   private headingPrimed = false;
+
+  /**
+   * The lens's own heading, atan2(x, z), refreshed at the end of every compose.
+   *
+   * This is the contract's `yaw`, and the player's move stick is resolved
+   * against it — so it has to be the direction the PLAYER IS LOOKING, measured
+   * off the finished camera after the shake and the buffet, not the boom's
+   * `aimYaw`. Those differ by up to the corner-lead arc, and a stick resolved
+   * against the arm rather than the lens sends the character off at an angle to
+   * the pressed direction on every corner.
+   */
+  private viewYaw = 0;
+
+  /**
+   * The subject's spin rate about up, differenced from `facing`.
+   *
+   * Stands in for the bike's `angularVelocity.y`, which the player state has no
+   * equivalent of. Only the air swing reads it — see `beginAirSwing`.
+   */
+  private readonly subjectYaw = new YawRateTracker();
 
   // FOV.
   private fovBase: number;
@@ -1063,7 +1095,7 @@ export class CameraDirector implements ICameraDirector {
   private boomDesired = 8;
 
   // Occluders (other riders).
-  private occluders: readonly BikeState[] | null = null;
+  private occluders: readonly PlayerState[] | null = null;
   private occNodes: (Object3D | null)[] = new Array(MAX_OCCLUDERS).fill(null);
   private occCount = 0;
   private discovered: Object3D[] = [];
@@ -1089,6 +1121,11 @@ export class CameraDirector implements ICameraDirector {
   private cineAnchor = new Vector3();
   private cineValid = false;
   private cineSide = 1;
+  /** Label of the shot `beginCinematic` was last asked for. */
+  cinematicName = '';
+  /** Seconds the current cinematic runs for. Infinity = until told otherwise. */
+  private cineDuration = Infinity;
+  private cineElapsed = 0;
 
   // Orbit / free / fixed.
   private orbitYaw = 0.6;
@@ -1115,8 +1152,8 @@ export class CameraDirector implements ICameraDirector {
   replayProgress = 0;
 
   /** Fired on a detected landing / crash. The FX facade hangs dust off these. */
-  onLandingEvent: ((state: BikeState, impact: number) => void) | null = null;
-  onCrashEvent: ((state: BikeState, severity: number) => void) | null = null;
+  onLandingEvent: ((state: PlayerState, impact: number) => void) | null = null;
+  onCrashEvent: ((state: PlayerState, severity: number) => void) | null = null;
 
   constructor(opts: CameraDirectorOptions) {
     this.camera = opts.camera;
@@ -1156,13 +1193,13 @@ export class CameraDirector implements ICameraDirector {
    * Register the OTHER riders on the mountain so the boom can avoid them.
    *
    * This is the supported path and the Game should call it once, with every
-   * non-player racer's BikeState:
+   * non-player racer's PlayerState:
    *
    *   dir.setOccluders(race.racers.filter(r => r !== race.player).map(r => r.bike.state));
    *
    * Passing null re-enables the scene-scan fallback below.
    */
-  setOccluders(states: readonly BikeState[] | null): void {
+  setOccluders(states: readonly PlayerState[] | null): void {
     this.occluders = states && states.length ? states : null;
     this.autoDiscover = !this.occluders;
     if (this.occluders) {
@@ -1215,7 +1252,7 @@ export class CameraDirector implements ICameraDirector {
    * Fill `_occPos` / `occNodes` with every rider that is NOT the subject.
    * Zero allocation: the slots are module-scope and refilled in place.
    */
-  private gatherOccluders(subject: BikeState, dt: number): void {
+  private gatherOccluders(subject: PlayerState, dt: number): void {
     this.occCount = 0;
 
     if (this.occluders) {
@@ -1253,7 +1290,7 @@ export class CameraDirector implements ICameraDirector {
    * optional and defaults to `dt`; pass the unscaled delta so the slow-mo
    * envelope can end (driving it with its own output would never release).
    */
-  update(target: BikeState, dt: number, time: number, realDt?: number): void {
+  update(target: PlayerState, dt: number, time: number, realDt?: number): void {
     this.subject = target;
     const d = clamp(dt, 0, 0.1);
     const rd = clamp(realDt ?? dt, 0, 0.1);
@@ -1271,6 +1308,7 @@ export class CameraDirector implements ICameraDirector {
     }
     this.lastSubject.copy(target.position);
     this.subjectSeen = true;
+    this.subjectYaw.step(target.facing, rd);
 
     if (this.autoDetect) this.detectEvents(target, rd);
     this.updateCrashFocus(rd);
@@ -1392,7 +1430,7 @@ export class CameraDirector implements ICameraDirector {
 
   // ── Chase ─────────────────────────────────────────────────────────────────
 
-  private updateChase(t: BikeState, dt: number): void {
+  private updateChase(t: PlayerState, dt: number): void {
     _flatVel.copy(t.velocity);
     _flatVel.y = 0;
     const planar = _flatVel.length();
@@ -1458,7 +1496,7 @@ export class CameraDirector implements ICameraDirector {
     this.aimYaw = dampAngleHL(this.aimYaw, travelYaw, lagHL, dt);
 
     // Air framing: pull back and rise so the whole arc is legible.
-    const airborne = t.mode === BikeMode.Airborne;
+    const airborne = t.mode === MoveMode.Airborne;
     const airH = airborne ? Math.max(t.airHeight, 0) : 0;
     const airLift = clamp(airH * 0.10, 0, 2.2);
     const airPull = clamp(airH * 0.16, 0, 2.8);
@@ -1576,10 +1614,10 @@ export class CameraDirector implements ICameraDirector {
 
   // ── Air swing ─────────────────────────────────────────────────────────────
 
-  private updateAirSwing(t: BikeState, dt: number): void {
+  private updateAirSwing(t: PlayerState, dt: number): void {
     if (this.swingCooldown > 0) this.swingCooldown -= dt;
 
-    const airborne = t.mode === BikeMode.Airborne;
+    const airborne = t.mode === MoveMode.Airborne;
 
     if (!this.swingActive && airborne && this.swingCooldown <= 0 && this.crashFocus <= 0.01) {
       const rem = estimateAirRemaining(t);
@@ -1642,8 +1680,8 @@ export class CameraDirector implements ICameraDirector {
     // Orbit AGAINST the spin: the relative rotation is larger, which is what
     // makes the trick read. Orbiting with it would cancel the spin out and the
     // rider would look like they were hanging still in the air.
-    if (t && Math.abs(t.angularVelocity.y) > 0.6) {
-      this.swingDir = t.angularVelocity.y > 0 ? -1 : 1;
+    if (t && Math.abs(this.subjectYaw.rate) > 0.6) {
+      this.swingDir = this.subjectYaw.rate > 0 ? -1 : 1;
     } else if (Math.abs(this.yawRate) > 0.15) {
       this.swingDir = this.yawRate > 0 ? 1 : -1;
     } else {
@@ -1653,7 +1691,7 @@ export class CameraDirector implements ICameraDirector {
 
   // ── FOV ───────────────────────────────────────────────────────────────────
 
-  private updateFov(t: BikeState | null, dt: number): void {
+  private updateFov(t: PlayerState | null, dt: number): void {
     let target = this.fovBase;
 
     if (t) {
@@ -1666,7 +1704,7 @@ export class CameraDirector implements ICameraDirector {
       target += this.surgeFov();
       // Narrowing slightly in the air makes the height read as height. The
       // instinct is to widen for drama; widening actually flattens the drop.
-      if (t.mode === BikeMode.Airborne) target -= clamp(t.airHeight * 0.22, 0, 3.2);
+      if (t.mode === MoveMode.Airborne) target -= clamp(t.airHeight * 0.22, 0, 3.2);
 
       if (t.boosting) {
         if (!this.prevBoosting) this.fovKick(6.5);
@@ -1696,7 +1734,7 @@ export class CameraDirector implements ICameraDirector {
 
   // ── Slow-mo ───────────────────────────────────────────────────────────────
 
-  private updateSlowMo(t: BikeState | null, realDt: number): void {
+  private updateSlowMo(t: PlayerState | null, realDt: number): void {
     if (this.slowCooldown > 0) this.slowCooldown -= realDt;
 
     if (
@@ -1704,7 +1742,7 @@ export class CameraDirector implements ICameraDirector {
       !this.slowActive &&
       this.slowCooldown <= 0 &&
       this.mode === CameraMode.Chase &&
-      t.mode === BikeMode.Airborne &&
+      t.mode === MoveMode.Airborne &&
       t.peakAirHeight >= CAMERA_TUNING.slowMoMinPeak &&
       t.airTime > CAMERA_TUNING.slowMoMinAirTime &&
       // At or just past apex. Detected by the SIGN of the vertical velocity, not
@@ -1918,12 +1956,12 @@ export class CameraDirector implements ICameraDirector {
 
   // ── Events ────────────────────────────────────────────────────────────────
 
-  private detectEvents(t: BikeState, dt: number): void {
+  private detectEvents(t: PlayerState, dt: number): void {
     if (this.landCooldown > 0) this.landCooldown -= dt;
     if (this.crashCooldown > 0) this.crashCooldown -= dt;
 
-    const airborneNow = t.mode === BikeMode.Airborne;
-    const crashingNow = t.mode === BikeMode.Crashing;
+    const airborneNow = t.mode === MoveMode.Airborne;
+    const crashingNow = t.mode === MoveMode.Hurt;
 
     // Landings are detected from the mode TRANSITION as well as from the
     // one-step flag, because update() runs once per rendered frame while
@@ -1935,7 +1973,7 @@ export class CameraDirector implements ICameraDirector {
       this.onLanding(t);
     }
 
-    const crashed = t.crashedThisStep || (!this.prevCrashing && crashingNow);
+    const crashed = t.hurtThisStep || (!this.prevCrashing && crashingNow);
     if (crashed && this.crashCooldown <= 0) {
       this.crashCooldown = 0.40;
       this.onCrash(t);
@@ -1944,7 +1982,7 @@ export class CameraDirector implements ICameraDirector {
     if (crashingNow) this.crashStrikes(t, dt);
     else this.crashStrikeCd = 0;
     this.crashPrevSpeed = t.speed;
-    this.crashPrevContact = !!(t.rear?.grounded || t.front?.grounded);
+    this.crashPrevContact = isAttached(t);
 
     this.prevAirborne = airborneNow;
     this.prevCrashing = crashingNow;
@@ -1968,12 +2006,12 @@ export class CameraDirector implements ICameraDirector {
    * the punch land on the same frame: a contact rising edge, or a single-frame
    * speed loss too large to be friction.
    */
-  private crashStrikes(t: BikeState, dt: number): void {
+  private crashStrikes(t: PlayerState, dt: number): void {
     if (this.crashStrikeCd > 0) {
       this.crashStrikeCd -= dt;
       return;
     }
-    const contact = !!(t.rear?.grounded || t.front?.grounded);
+    const contact = isAttached(t);
     const drop = this.crashPrevSpeed - t.speed;
     const hardHit = drop > CAMERA_TUNING.crashStrikeDrop && t.speed > 0.8;
     if (!((contact && !this.crashPrevContact) || hardHit)) return;
@@ -1994,7 +2032,7 @@ export class CameraDirector implements ICameraDirector {
   }
 
   /** Public so a caller with exact physics-step timing can drive it instead. */
-  onLanding(t: BikeState): void {
+  onLanding(t: PlayerState): void {
     const impact = clamp01(t.landingImpact);
     if (impact < 0.04) return;
 
@@ -2013,9 +2051,17 @@ export class CameraDirector implements ICameraDirector {
     this.onLandingEvent?.(t, impact);
   }
 
-  onCrash(t: BikeState): void {
-    const sev = clamp01(t.crashSeverity || 0.6);
-    _tmp.copy(t.crashDirection).multiplyScalar(-1);
+  onCrash(t: PlayerState): void {
+    const sev = hurtSeverity(t);
+    // Away from where the damage came from, and lifted, so the shake reads as
+    // the body being knocked back rather than shoved sideways. `hurtDirection`
+    // points from the source toward the player, so it is already the direction
+    // the knockback travels — no negation, unlike the bike's `crashDirection`,
+    // which pointed at the ground the frame went down on.
+    _tmp.copy(t.hurtDirection);
+    if (_tmp.lengthSq() < 1e-6) _tmp.copy(t.velocity).setY(0);
+    if (_tmp.lengthSq() < 1e-6) _tmp.set(0, 0, 1);
+    _tmp.normalize();
     _tmp.y += 0.7;
     this.shakeFrom(_tmp, 0.65 + sev * 0.85, 0.55 + sev * 0.45);
     this.swingActive = false;
@@ -2039,7 +2085,58 @@ export class CameraDirector implements ICameraDirector {
 
   // ── Cinematic ─────────────────────────────────────────────────────────────
 
-  private updateCinematic(t: BikeState, dt: number, time: number): void {
+  /**
+   * ICameraDirector. Frame a set piece or a boss opening.
+   *
+   * `name` is a label the caller uses to identify its own shot; the director
+   * keeps it for `cinematicName` and picks the anchor itself, because where a
+   * flattering three-quarter stand-off IS depends on the terrain and on which
+   * side of the route the character is running — which the caller does not know
+   * and this class does. `duration` is how long the mode holds before it hands
+   * control back; 0 or less holds it until the caller changes `mode`.
+   */
+  beginCinematic(name: string, duration: number): void {
+    this.cinematicName = name;
+    this.cineDuration = duration > 0 ? duration : Infinity;
+    this.cineElapsed = 0;
+    // Force a fresh anchor rather than reusing the last shot's: `updateCinematic`
+    // only repicks once the subject has run 62 m from it, so a second cinematic
+    // started nearby would open on the previous one's framing.
+    this.cineValid = false;
+    this.mode = CameraMode.Cinematic;
+    if (this.subject) this.pickCinematicAnchor(this.subject);
+  }
+
+  /**
+   * ICameraDirector. A deliberate time dilation, as opposed to the automatic
+   * big-air hold.
+   *
+   * Bypasses the cooldown — an explicit request from a set piece or a boss hit
+   * must not be silently dropped because a jump happened to spend it — and
+   * leaves no cooldown behind for the same reason. The envelope is split so the
+   * attack and release are a fixed short fraction and the hold takes the rest,
+   * which keeps a 2 s request from spending a second of itself ramping.
+   */
+  slowMotion(scale: number, duration: number): void {
+    const d = Math.max(duration, 0.05);
+    const a = Math.min(0.12, d * 0.2);
+    const r = Math.min(0.30, d * 0.3);
+    this.slowActive = false;
+    this.beginSlowMo(clamp(scale, 0.02, 1), a, Math.max(d - a - r, 0), r, 0);
+  }
+
+  private updateCinematic(t: PlayerState, dt: number, time: number): void {
+    // A timed cinematic hands control back on its own. Without this the mode is
+    // a one-way door: a set piece that opens a shot and then forgets to close
+    // it leaves the player driving a crane.
+    this.cineElapsed += dt;
+    if (this.cineElapsed >= this.cineDuration) {
+      this.cineDuration = Infinity;
+      this.mode = CameraMode.Chase;
+      this.resetTo(t);
+      return;
+    }
+
     _tmp.copy(t.position).sub(this.cineAnchor);
     _tmp.y = 0;
     if (!this.cineValid || _tmp.length() > 62) this.pickCinematicAnchor(t);
@@ -2068,7 +2165,7 @@ export class CameraDirector implements ICameraDirector {
     this.roll = dampHL(this.roll, 0, 0.4, dt);
   }
 
-  private pickCinematicAnchor(t: BikeState): void {
+  private pickCinematicAnchor(t: PlayerState): void {
     _flatVel.copy(t.velocity);
     _flatVel.y = 0;
     if (_flatVel.lengthSq() < 1e-4) _flatVel.copy(this.forwardAxis).applyQuaternion(t.orientation);
@@ -2100,7 +2197,7 @@ export class CameraDirector implements ICameraDirector {
     this.orbitSpin = spin;
   }
 
-  private updateOrbit(t: BikeState, dt: number): void {
+  private updateOrbit(t: PlayerState, dt: number): void {
     const cf = this.crashFocus;
 
     // The arc ACCELERATES through a wreck. A constant-rate orbit is the correct
@@ -2217,10 +2314,23 @@ export class CameraDirector implements ICameraDirector {
     this.camera.up.set(0, 1, 0);
     this.camera.lookAt(lookAt);
     this.camera.updateMatrixWorld();
+
+    // Publish the view yaw HERE as well as at the end of compose().
+    //
+    // `yaw` is what the player's move stick is resolved against, and the first
+    // fixed step after a snap runs BEFORE the first compose — `Engine.advance`
+    // steps physics and only then renders. Without this, the frame after a boot
+    // or a respawn resolves the stick against a stale yaw (0, on the very first
+    // one), so holding forward on frame one sends the character along +Z rather
+    // than away from the camera.
+    this.camera.getWorldDirection(_viewDir);
+    if (_viewDir.x * _viewDir.x + _viewDir.z * _viewDir.z > 1e-8) {
+      this.viewYaw = Math.atan2(_viewDir.x, _viewDir.z);
+    }
   }
 
   /** Re-seat the chase rig on the subject with no spring travel. Use on reset. */
-  resetTo(target: BikeState): void {
+  resetTo(target: PlayerState): void {
     this.headingPrimed = false;
     this.aimYaw = 0;
     this.yawRate = 0;
@@ -2288,8 +2398,12 @@ export class CameraDirector implements ICameraDirector {
     this.subject = target;
     this.lastSubject.copy(target.position);
     this.subjectSeen = true;
-    this.prevAirborne = target.mode === BikeMode.Airborne;
-    this.prevCrashing = target.mode === BikeMode.Crashing;
+    this.prevAirborne = target.mode === MoveMode.Airborne;
+    this.prevCrashing = target.mode === MoveMode.Hurt;
+    // A re-seat is a teleport, and a teleport is not a rotation: adopt the
+    // facing so the first frame after it reports zero spin rather than the
+    // whole angular jump divided by one frame.
+    this.subjectYaw.reset(target.facing);
     this.timeScale = 1;
     this.slowActive = false;
     this.crashT = -1;
@@ -2474,7 +2588,7 @@ export class CameraDirector implements ICameraDirector {
 
   // ── Compose ───────────────────────────────────────────────────────────────
 
-  private compose(subject: BikeState, dt: number): void {
+  private compose(subject: PlayerState, dt: number): void {
     // Modes that hang off a moving subject and therefore get the full boom
     // solve. Orbit and Cinematic are HAND-FRAMED — `summit-wide` is a
     // deliberate 52 m crane and `valley-vista` a 180 m establishing shot, and
@@ -2601,6 +2715,13 @@ export class CameraDirector implements ICameraDirector {
     _tmp.copy(this.mode === CameraMode.Replay ? this.replayPosition : subject.position);
     _tmp.y += CAMERA_TUNING.subjectPivotHeight;
     publishDustShot(_tmp.x, _tmp.y, _tmp.z, CAMERA_TUNING.subjectClearRadius);
+
+    // The heading the move stick is resolved against. Taken from the composed
+    // camera, so it includes every rotation applied above.
+    this.camera.getWorldDirection(_viewDir);
+    if (_viewDir.x * _viewDir.x + _viewDir.z * _viewDir.z > 1e-8) {
+      this.viewYaw = Math.atan2(_viewDir.x, _viewDir.z);
+    }
   }
 
   /**
@@ -3018,7 +3139,7 @@ export class CameraDirector implements ICameraDirector {
    * boom solver) until the silhouette sits inside the band. Closed loop, damped,
    * clamped, and it relaxes back to neutral once the shot is comfortable.
    */
-  private updateFraming(subject: BikeState, dt: number): void {
+  private updateFraming(subject: PlayerState, dt: number): void {
     const src = this.mode === CameraMode.Replay ? this.replayPosition : subject.position;
     const tanHalf = Math.tan(this.camera.fov * DEG * 0.5);
     if (tanHalf < 1e-4) return;
