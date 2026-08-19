@@ -211,250 +211,629 @@ export interface ITrack {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Bike + rider physics
+// Player movement
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface WheelState {
-  /** World position of the contact point (or the wheel centre if airborne). */
-  contactPoint: Vector3;
-  contactNormal: Vector3;
-  /** True if the wheel is touching the ground this step. */
-  grounded: boolean;
-  /** Current suspension compression, 0 = topped out, 1 = bottomed. */
-  compression: number;
-  /** Compression velocity, +ve = compressing. Drives the visual and the audio. */
-  compressionVelocity: number;
-  /** Wheel spin angle, radians. */
-  spin: number;
-  /** Angular velocity, rad/s. */
-  spinRate: number;
-  /** Longitudinal slip ratio, -1..1. Negative = locked/skidding. */
-  slipRatio: number;
-  /** Lateral slip velocity, m/s. Drives dust and tyre squeal. */
-  lateralSlip: number;
-  /** Surface under this wheel. */
-  surface: SurfaceProperties;
-  /** Normal force, newtons. */
-  load: number;
-}
-
-export enum BikeMode {
+/**
+ * The movement state machine.
+ *
+ * Every mode is mutually exclusive and the physics reads exactly one branch per
+ * step. Modes exist rather than a pile of booleans because the transitions are
+ * where the game lives — `Airborne → WallRun` has an entry speed condition, a
+ * lockout and an animation blend, and none of that has anywhere to live if
+ * "wall running" is a flag on a generic airborne state.
+ */
+export enum MoveMode {
+  /** On the floor. Running, braking, standing, turning. */
   Grounded = 'grounded',
+  /** Ballistic. Covers rising, falling, and the post-dash coast. */
   Airborne = 'airborne',
-  Crashing = 'crashing',
-  Recovering = 'recovering',
+  /** Attached to a near-vertical surface, moving along it. */
+  WallRun = 'wall-run',
+  /** Attached to a rail spline. */
+  Grinding = 'grinding',
+  /** Low hull, low friction, gaining on descents. */
+  Sliding = 'sliding',
+  /** Committed to a dash. Steering is locked for `DASH.lockTime`. */
+  Dashing = 'dashing',
+  /** Travelling toward a homing-attack target. */
+  Homing = 'homing',
+  /** Straight-down dive. Resolves into a ground-pound shockwave. */
+  Diving = 'diving',
+  /** Stunned by damage. No control for `DAMAGE.stunTime`. */
+  Hurt = 'hurt',
+  /** Past the finish. Physics still runs so the victory run-out looks alive. */
   Finished = 'finished',
 }
 
+/** Which traversal affordance the player is currently able to use, for the HUD. */
+export enum TraversalPrompt {
+  None = 'none',
+  Rail = 'rail',
+  Wall = 'wall',
+  Homing = 'homing',
+  Spring = 'spring',
+}
+
 /**
- * The full physical state of one bike+rider. Read by the rider rig, camera,
- * FX, HUD, AI and audio. Nothing else in the game should describe motion.
+ * The full state of the player. Read by the character rig, camera, FX, HUD,
+ * audio and the stage director. Nothing else in the game may describe motion.
+ *
+ * This is the direct replacement for the old `BikeState` and deliberately keeps
+ * the field names its consumers already use — `position`, `velocity`, `speed`,
+ * `mode`, `boost`, `boosting`, `landedThisStep`, `landingImpact`, `airHeight`
+ * — so the camera, dust, speed lines and audio port across by changing a type
+ * name rather than by being rewritten.
  */
-export interface BikeState {
-  position: Vector3;      // rear-axle-ish reference point, world space
+export interface PlayerState {
+  position: Vector3;      // feet, world space
   velocity: Vector3;      // m/s, world
   orientation: Quaternion;
-  angularVelocity: Vector3;
+  /** Facing yaw in radians, separate from `orientation` so the rig can lead it. */
+  facing: number;
 
-  /** Signed forward speed along the bike's own forward axis, m/s. */
-  forwardSpeed: number;
-  /** Total speed magnitude, m/s. */
+  /** Horizontal speed, m/s. The number the game is about. */
+  groundSpeed: number;
+  /** Total speed magnitude including vertical, m/s. */
   speed: number;
+  /** Signed speed along `facing`. Negative while running backwards. */
+  forwardSpeed: number;
 
-  /** Body lean about the forward axis, radians. Positive = leaning right. */
-  lean: number;
-  /** Steering angle at the bars, radians. */
-  steerAngle: number;
-  /** Frame pitch relative to the ground plane, radians. */
-  pitch: number;
-
-  front: WheelState;
-  rear: WheelState;
-
-  mode: BikeMode;
+  mode: MoveMode;
   /** Seconds spent in the current mode. */
   modeTime: number;
-  /** Height above the ground directly below, metres. */
+  /** The mode the character was in before this one. Drives animation blends. */
+  previousMode: MoveMode;
+
+  /** Surface normal under the feet, or of the wall while wall running. */
+  groundNormal: Vector3;
+  /** Slerped visual up — never the raw floor normal. See `SLOPE.alignRate`. */
+  alignedUp: Vector3;
+  /** Signed gradient along travel, radians. Negative = descending. */
+  gradient: number;
+  /** Surface being stood on, or last stood on while airborne. */
+  surface: SurfaceProperties;
+
+  /** Metres to the ground directly below. 0 while grounded. */
   airHeight: number;
-  /** Time since the last time both wheels were grounded. */
+  /** Seconds since the character last had a floor. */
   airTime: number;
-  /** Peak height reached in the current jump. */
+  /** Peak height above the takeoff point in the current airtime, metres. */
   peakAirHeight: number;
+  /** Height the current airtime started at, for fall-damage and hard landings. */
+  takeoffHeight: number;
 
-  /** 0..1 how compressed the rider is (preload). */
-  preload: number;
-  /** Energy stored by a good preload, released on the lip. 0..1. */
-  pumpCharge: number;
-  /** True during a manual (front wheel lifted). */
-  manualling: boolean;
-  /** 0..1 front wheel lift amount. */
-  manualAmount: number;
+  // ── Charges and cooldowns ─────────────────────────────────────────────────
+  /** Double jumps remaining this airtime. */
+  jumpsLeft: number;
+  /** Air dashes remaining this airtime. */
+  dashesLeft: number;
+  /** Seconds until the next ground dash is allowed. */
+  dashCooldown: number;
 
-  /** Boost meter 0..1 and whether boost is currently firing. */
-  boost: number;
+  // ── Attachments ───────────────────────────────────────────────────────────
+  /** Index into the rail network while `Grinding`, else -1. */
+  railIndex: number;
+  /** Distance along the attached rail, metres. */
+  railDistance: number;
+  /** Outward normal of the wall while `WallRun`, else zero. */
+  wallNormal: Vector3;
+  /** Identity of the wall being run, so the same one cannot be remounted. */
+  wallId: number;
+  /** Seconds of wall run remaining before gravity returns in full. */
+  wallTimeLeft: number;
+
+  // ── Boost ─────────────────────────────────────────────────────────────────
+  boost: number;          // 0..1 meter
   boosting: boolean;
 
-  /** Set for exactly one physics step when the bike lands. */
+  // ── Combat ────────────────────────────────────────────────────────────────
+  attack: AttackState;
+  health: number;
+  /** Seconds of damage immunity remaining. */
+  invulnTime: number;
+  /** Homing target index, or -1. */
+  homingTarget: number;
+  /** What the player could do right now, for the HUD's contextual prompt. */
+  prompt: TraversalPrompt;
+
+  // ── One-step event flags ──────────────────────────────────────────────────
+  /** True for exactly one physics step on touchdown. */
   landedThisStep: boolean;
-  /** Landing impact severity 0..1, valid on the step landedThisStep is true. */
+  /** 0..1 landing severity, valid only on the step `landedThisStep` is true. */
   landingImpact: number;
-  /** How well the landing angle matched the slope. 1 = perfect. */
-  landingQuality: number;
-  /** Set for exactly one step when a crash begins. */
-  crashedThisStep: boolean;
-  /** Direction the crash impulse came from, world space, normalised. */
-  crashDirection: Vector3;
-  crashSeverity: number;
+  /** True when the landing was hard enough to cost recovery time. */
+  hardLanding: boolean;
+  /** True for exactly one step when a jump leaves the ground. */
+  jumpedThisStep: boolean;
+  /** True for exactly one step when a dash fires. */
+  dashedThisStep: boolean;
+  /** True for exactly one step when a wall is mounted. */
+  wallMountedThisStep: boolean;
+  /** True for exactly one step when a rail is mounted. */
+  railMountedThisStep: boolean;
+  /** True for exactly one step when damage lands. */
+  hurtThisStep: boolean;
+  /** Direction the damage came from, world, normalised. */
+  hurtDirection: Vector3;
 }
 
-/** Everything the physics needs from the outside world each step. */
-export interface BikeInput {
-  steer: number;       // -1..1
-  pedal: number;       // 0..1
-  brakeRear: number;   // 0..1
-  brakeFront: number;  // 0..1
-  crouch: number;      // 0..1
-  pitchLean: number;   // -1..1
-  /** Air rotation intent: x = flip (pitch), y = spin (yaw), z = roll. */
-  airPitch: number;
-  airYaw: number;
-  airRoll: number;
-  wantBoost: boolean;
-  wantHop: boolean;
+/** Everything the player physics needs from the outside world each step. */
+export interface PlayerInput {
+  /** Desired move direction in CAMERA space, -1..1 each. Magnitude is intent. */
+  moveX: number;
+  moveZ: number;
+  /** Camera yaw the move vector is relative to, radians. */
+  cameraYaw: number;
+
+  /** Edge-triggered. Consumed by the physics, which clears it. */
+  jump: boolean;
+  /** Level. Releasing while rising cuts the jump. */
+  jumpHeld: boolean;
+  dash: boolean;
+  /** Level. Crouch/slide. */
+  crouch: boolean;
+  attack: boolean;
+  /** Level. Boost fires while held and the meter allows. */
+  boost: boolean;
+  /** Down-dash / dive request. */
+  dive: boolean;
 }
 
-export interface IBike {
-  readonly state: BikeState;
+export interface IPlayer {
+  readonly state: PlayerState;
   readonly object: Object3D;
-  /** Anchor transforms the rider rig's IK targets attach to. */
-  readonly anchors: BikeAnchors;
 
-  step(input: BikeInput, dt: number): void;
+  step(input: PlayerInput, dt: number): void;
   /** Interpolated visual update. `alpha` blends the last two physics states. */
-  updateVisual(alpha: number, dt: number): void;
+  updateVisual(alpha: number, dt: number, time: number): void;
 
-  reset(position: Vector3, forward: Vector3): void;
+  /** Apply damage from a world position. Respects invulnerability. */
+  damage(amount: number, from: Vector3): boolean;
+  /** Refresh air charges — called on a homing hit, rail mount or wall jump. */
+  refreshAirCharges(): void;
+
+  reset(position: Vector3, facing: number): void;
   dispose(): void;
 }
 
-/** Where the rider's hands, feet and seat attach. All are Object3Ds on the bike. */
-export interface BikeAnchors {
-  barLeft: Object3D;
-  barRight: Object3D;
-  pedalLeft: Object3D;
-  pedalRight: Object3D;
-  seat: Object3D;
-  /** Frame origin — the rider's pelvis orbits this. */
-  frame: Object3D;
-  /** Where dust is emitted from. */
-  frontContact: Object3D;
-  rearContact: Object3D;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Rider rig
+// Traversal furniture — rails, walls, springs
 // ─────────────────────────────────────────────────────────────────────────────
 
-export enum TrickKind {
-  None = 'none',
-  Tabletop = 'tabletop',
-  XUp = 'x-up',
-  Superman = 'superman',
-  Tailwhip = 'tailwhip',
-  Spin360 = '360',
-  Backflip = 'backflip',
-  Frontflip = 'frontflip',
-  Manual = 'manual',
-  NoFooter = 'no-footer',
+/** A sample of a grind rail at a distance along it. */
+export interface RailSample {
+  position: Vector3;
+  /** Unit tangent, in the rail's forward direction. */
+  tangent: Vector3;
+  /** Unit up, for placing the character and banking the rig. */
+  up: Vector3;
+  distance: number;
+  /** Signed gradient along the tangent, radians. Negative = descending. */
+  gradient: number;
 }
 
-export interface TrickState {
-  kind: TrickKind;
-  /** 0..1 through the trick pose. */
-  phase: number;
-  /** Accumulated rotations for spins/flips. */
-  rotations: number;
-  /** Points this trick will bank if landed cleanly. */
-  pendingScore: number;
-  /** True once the trick has fully returned to neutral and can be landed. */
-  committed: boolean;
+export enum RailKind {
+  /** A pipe or cable following the route. The bread and butter. */
+  Route = 'route',
+  /** A shortcut that leaves the route and rejoins it further down, faster. */
+  Shortcut = 'shortcut',
+  /** Crosses a gap the player otherwise has to jump. */
+  Span = 'span',
+  /** Spirals down a vertical drop. */
+  Helix = 'helix',
 }
 
-/**
- * The rider rig. Owns its skeleton, its meshes, and all procedural animation.
- * It is a pure consumer of BikeState + TrickState — it never drives physics.
- */
-export interface IRiderRig {
+export interface RailInfo {
+  index: number;
+  kind: RailKind;
+  length: number;
+  /** Track distance at which this rail becomes relevant, for activation. */
+  routeDistance: number;
+  /** Track distance the rail delivers you to. */
+  exitRouteDistance: number;
+  /** Both endpoints, world space, for proximity culling. */
+  start: Vector3;
+  end: Vector3;
+}
+
+export interface IRailNetwork {
+  readonly object: Object3D;
+  readonly rails: RailInfo[];
+
+  /**
+   * Find the best rail to mount for a character sweeping from `from` to `to`.
+   *
+   * Must be a SWEPT test. At 74 m/s a physics step covers 0.62 m and a rail is
+   * a few centimetres across; a point-in-radius test misses it in almost every
+   * step in which it should have hit.
+   */
+  findMount(
+    from: Vector3,
+    to: Vector3,
+    velocity: Vector3,
+    excludeIndex: number,
+  ): { index: number; distance: number; sample: RailSample } | null;
+
+  sampleAt(index: number, distance: number, out?: RailSample): RailSample;
+  lengthOf(index: number): number;
+
+  /** Activate/deactivate rail visuals by route progress. */
+  update(playerRouteDistance: number, dt: number): void;
+  dispose(): void;
+}
+
+/** A wall-run surface. */
+export interface WallHit {
+  id: number;
+  /** Outward normal, unit, pointing away from the wall face. */
+  normal: Vector3;
+  /** Contact point on the wall. */
+  point: Vector3;
+  /** Unit direction along the wall, chosen to agree with the player's travel. */
+  along: Vector3;
+  /** Metres of wall remaining ahead along `along`. */
+  runLength: number;
+}
+
+export interface IWallSet {
   readonly object: Object3D;
   /**
-   * Drive the whole rig for one visual frame.
-   * Must leave hands exactly on the bar anchors and feet on the pedal anchors.
+   * Swept probe for a runnable wall. Same tunnelling argument as `findMount`.
    */
-  update(state: BikeState, trick: TrickState, dt: number, time: number): void;
-  setJerseyColor(jersey: number, accent: number): void;
+  probe(from: Vector3, to: Vector3, velocity: Vector3, excludeId: number): WallHit | null;
+  update(playerRouteDistance: number, dt: number): void;
+  dispose(): void;
+}
+
+export enum BoosterKind {
+  /** Launches the player on a fixed arc. */
+  Spring = 'spring',
+  /** Adds speed along the route without changing direction. */
+  Booster = 'booster',
+  /** A ring you dash through for a speed gain and a refreshed air dash. */
+  DashRing = 'dash-ring',
+  /** A ramp that converts speed into height. Geometry, not a trigger. */
+  Ramp = 'ramp',
+}
+
+export interface BoosterHit {
+  kind: BoosterKind;
+  /** Velocity to SET (Spring, DashRing) or ADD (Booster), m/s. */
+  impulse: Vector3;
+  /** True if `impulse` replaces velocity rather than adding to it. */
+  absolute: boolean;
+  /** Refresh the player's air charges on use. */
+  refreshes: boolean;
+  position: Vector3;
+}
+
+export interface IBoosterField {
+  readonly object: Object3D;
+  /** Swept test. Returns at most one hit per step. */
+  probe(from: Vector3, to: Vector3, velocity: Vector3): BoosterHit | null;
+  update(playerRouteDistance: number, dt: number): void;
+  dispose(): void;
+}
+
+/** Everything traversal, behind one handle the physics can hold. */
+export interface ITraversal {
+  readonly rails: IRailNetwork;
+  readonly walls: IWallSet;
+  readonly boosters: IBoosterField;
+  readonly object: Object3D;
+  update(playerRouteDistance: number, dt: number): void;
   dispose(): void;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Race
+// Collectibles
 // ─────────────────────────────────────────────────────────────────────────────
 
-export enum RacePhase {
-  Attract = 'attract',
-  Countdown = 'countdown',
-  Racing = 'racing',
-  Finished = 'finished',
-  Results = 'results',
-  Paused = 'paused',
+export enum PickupKind {
+  /** The common collectible. Strung along fast lines to reward committing. */
+  Fragment = 'fragment',
+  /** Rare, hidden, off-route. The reason to explore on a replay. */
+  Shard = 'shard',
+  /** Restores one health. */
+  Cell = 'cell',
+  /** Fills the boost meter. */
+  Charge = 'charge',
+  /** Adds seconds to the stage clock. */
+  Time = 'time',
 }
 
-export interface RacerProgress {
-  id: string;
-  name: string;
-  isPlayer: boolean;
-  /** Distance along the track, metres. Monotonic; wrong-way does not reduce it. */
-  distance: number;
-  /** Live position, 1 = leading. */
-  position: number;
-  /** Seconds since the start gun. */
-  raceTime: number;
-  finished: boolean;
-  finishTime: number | null;
-  /** Split times at each checkpoint, seconds since start. */
-  splits: (number | null)[];
-  trickScore: number;
-  /** Gap to the racer ahead in seconds. Null for the leader. */
-  gapAhead: number | null;
-  /** Colour index into RIDER_COLORS. */
-  colorIndex: number;
-  crashCount: number;
+export interface PickupEvent {
+  kind: PickupKind;
+  position: Vector3;
+  /** Index in the field, so the stage can mark it taken. */
+  index: number;
 }
 
-export interface IRacer {
-  readonly id: string;
-  readonly bike: IBike;
-  readonly rig: IRiderRig;
-  readonly progress: RacerProgress;
-  readonly trick: TrickState;
+export interface IPickupField {
   readonly object: Object3D;
-  /** Produce this racer's input for the next physics step. */
-  gatherInput(dt: number, ctx: RaceContext): BikeInput;
-  update(dt: number, ctx: RaceContext): void;
-  updateVisual(alpha: number, dt: number, time: number): void;
+  readonly totals: Record<PickupKind, number>;
+  /** Swept collection test. May return several in one step at speed. */
+  collect(from: Vector3, to: Vector3, radius: number, out: PickupEvent[]): number;
+  update(playerRouteDistance: number, dt: number, time: number): void;
   reset(): void;
   dispose(): void;
 }
 
-/** Read-only view of the race handed to every racer each step. */
-export interface RaceContext {
-  terrain: ITerrain;
-  track: ITrack;
-  racers: IRacer[];
-  phase: RacePhase;
-  raceTime: number;
-  /** Leader distance, for rubber-banding. */
-  leaderDistance: number;
-  dt: number;
+// ─────────────────────────────────────────────────────────────────────────────
+// Combat
+// ─────────────────────────────────────────────────────────────────────────────
+
+export enum AttackKind {
+  None = 'none',
+  /** Ground combo, three hits. */
+  Combo1 = 'combo-1',
+  Combo2 = 'combo-2',
+  Combo3 = 'combo-3',
+  /** In-air swipe. */
+  Aerial = 'aerial',
+  /** Attack out of a dash — carries the dash's speed into the hit. */
+  DashAttack = 'dash-attack',
+  /** Upward launcher. Pops an enemy into juggle range. */
+  Launcher = 'launcher',
+  /** The dive's landing shockwave. */
+  Slam = 'slam',
+  /** Held charge release. */
+  Charged = 'charged',
+}
+
+export interface AttackState {
+  kind: AttackKind;
+  /** 0..1 through the active animation. */
+  phase: number;
+  /** True during the frames the hitbox is live. */
+  active: boolean;
+  /** Seconds of hit-stop remaining. Freezes the attacker AND the victim. */
+  hitStop: number;
+  /** Current combo count. Resets on a timeout or a whiff. */
+  combo: number;
+  /** Seconds left to continue the combo. */
+  comboWindow: number;
+  /** Held charge, 0..1. */
+  charge: number;
+}
+
+export enum EnemyKind {
+  /** Basic ground walker. */
+  Drone = 'drone',
+  /** Hovering, drifts across the route, a free homing-attack stepping stone. */
+  Floater = 'floater',
+  /** Fires tracking shots from a distance. */
+  Lancer = 'lancer',
+  /** Shielded from the front. Must be hit from behind or launched. */
+  Bulwark = 'bulwark',
+  /** Chases at speed and will follow the player onto rails. */
+  Stalker = 'stalker',
+  /** Anchored hazard — a turret or a crusher built into the mountain. */
+  Emplacement = 'emplacement',
+  /** Miniboss. Blocks the route until beaten. */
+  Warden = 'warden',
+}
+
+export enum EnemyPhase {
+  Idle = 'idle',
+  Alert = 'alert',
+  Pursue = 'pursue',
+  /** Windup. This is the telegraph the player reads. */
+  Telegraph = 'telegraph',
+  Attack = 'attack',
+  Recover = 'recover',
+  Stagger = 'stagger',
+  /** Popped into the air by a launcher. Juggleable. */
+  Airborne = 'airborne',
+  Dying = 'dying',
+  Dead = 'dead',
+}
+
+export interface EnemyState {
+  index: number;
+  kind: EnemyKind;
+  position: Vector3;
+  velocity: Vector3;
+  facing: number;
+  phase: EnemyPhase;
+  phaseTime: number;
+  health: number;
+  maxHealth: number;
+  /** True while the front shield is up and absorbing hits. */
+  guarding: boolean;
+  /** Seconds of hit-stop remaining. */
+  hitStop: number;
+  /** True while this enemy is a valid homing target. */
+  targetable: boolean;
+  /** Distance along the route this enemy belongs to, for streaming. */
+  routeDistance: number;
+  active: boolean;
+}
+
+export interface HitEvent {
+  enemyIndex: number;
+  position: Vector3;
+  /** Direction the hit pushed, world, normalised. */
+  direction: Vector3;
+  damage: number;
+  killed: boolean;
+  /** Combo count at the moment of the hit, for score and HUD feedback. */
+  combo: number;
+  /** True if this hit launched the enemy into the air. */
+  launched: boolean;
+}
+
+export interface IEnemyDirector {
+  readonly object: Object3D;
+  readonly enemies: EnemyState[];
+
+  /** Fixed step. Runs AI, movement and attack timing. */
+  step(player: PlayerState, dt: number): void;
+  updateVisual(alpha: number, dt: number, time: number): void;
+
+  /** Resolve the player's live hitbox against every enemy. */
+  resolvePlayerAttack(
+    origin: Vector3,
+    direction: Vector3,
+    radius: number,
+    kind: AttackKind,
+    combo: number,
+    out: HitEvent[],
+  ): number;
+
+  /** Best homing target for a player looking along `forward`. -1 if none. */
+  pickHomingTarget(from: Vector3, forward: Vector3): number;
+  /** Register a successful homing hit on a specific enemy. */
+  hitTarget(index: number, from: Vector3, out: HitEvent[]): number;
+
+  /** Damage the player should take this step, from contact and projectiles. */
+  consumePlayerDamage(): { amount: number; from: Vector3 } | null;
+
+  /** Stream enemies in and out by route progress. */
+  activate(playerRouteDistance: number): void;
+  reset(): void;
+  dispose(): void;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Boss
+// ─────────────────────────────────────────────────────────────────────────────
+
+export enum BossPhase {
+  Dormant = 'dormant',
+  Intro = 'intro',
+  Phase1 = 'phase-1',
+  Transition = 'transition',
+  Phase2 = 'phase-2',
+  Enraged = 'phase-3',
+  Defeated = 'defeated',
+  Outro = 'outro',
+}
+
+export interface BossState {
+  phase: BossPhase;
+  phaseTime: number;
+  health: number;
+  maxHealth: number;
+  /** 0..1 within the current phase's health band, for the HUD's segmented bar. */
+  phaseHealth: number;
+  position: Vector3;
+  /** Name of the attack being wound up or executed, for the telegraph readout. */
+  attackName: string | null;
+  /** 0..1 telegraph progress. The HUD flashes on this. */
+  telegraph: number;
+  /** True while a weak point is exposed and damage is possible. */
+  vulnerable: boolean;
+  /** True while the arena is asking the player to grind, wall run or dash. */
+  demandsTraversal: boolean;
+  hitStop: number;
+}
+
+export interface IBoss {
+  readonly object: Object3D;
+  readonly state: BossState;
+  readonly arenaCentre: Vector3;
+  readonly arenaRadius: number;
+
+  begin(): void;
+  step(player: PlayerState, dt: number): void;
+  updateVisual(alpha: number, dt: number, time: number): void;
+  /** Resolve a player attack against the boss. Returns damage dealt. */
+  resolvePlayerAttack(origin: Vector3, radius: number, kind: AttackKind, combo: number): HitEvent | null;
+  consumePlayerDamage(): { amount: number; from: Vector3 } | null;
+  reset(): void;
+  dispose(): void;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Character rig
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The character rig. Owns its skeleton, its meshes and all procedural
+ * animation, and is a pure consumer of `PlayerState` — it never drives physics.
+ *
+ * The contract that matters: the feet must stay planted. A procedural
+ * locomotion rig that lets the support foot drift is the single most obvious
+ * tell that a character is not really running, and it is worse at speed, not
+ * better.
+ */
+export interface ICharacterRig {
+  readonly object: Object3D;
+  update(state: PlayerState, dt: number, time: number): void;
+  setColors(primary: number, accent: number): void;
+  /** World transform of the hand, for anchoring weapon trails and FX. */
+  handWorld(side: 'left' | 'right', out: Vector3): Vector3;
+  dispose(): void;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage
+// ─────────────────────────────────────────────────────────────────────────────
+
+export enum StagePhase {
+  /** Attract loop behind the title. */
+  Title = 'title',
+  /** Character introduction / stage select. */
+  Intro = 'intro',
+  Countdown = 'countdown',
+  Running = 'running',
+  Boss = 'boss',
+  /** Reached the goal. */
+  Cleared = 'cleared',
+  /** Clock hit zero. */
+  Failed = 'failed',
+  Results = 'results',
+  Paused = 'paused',
+}
+
+export enum StageRank {
+  S = 'S',
+  A = 'A',
+  B = 'B',
+  C = 'C',
+  D = 'D',
+}
+
+/** Everything tracked for the results screen. */
+export interface StageStats {
+  /** Seconds elapsed. */
+  time: number;
+  /** Seconds left on the clock. */
+  timeLeft: number;
+  fragments: number;
+  fragmentsTotal: number;
+  shards: number;
+  shardsTotal: number;
+  enemiesDefeated: number;
+  enemiesTotal: number;
+  damageTaken: number;
+  /** Peak combo reached. */
+  bestCombo: number;
+  /** Accumulated style score. */
+  styleScore: number;
+  /** Shortcuts taken, out of those that exist. */
+  shortcuts: number;
+  shortcutsTotal: number;
+  /** Metres of rail ground and wall run — the traversal-mastery signal. */
+  grindDistance: number;
+  wallRunDistance: number;
+  /** Top speed reached, m/s. */
+  topSpeed: number;
+  rank: StageRank;
+  /** True if the run beat the saved best. */
+  isNewBest: boolean;
+}
+
+export interface IStageDirector {
+  readonly phase: StagePhase;
+  readonly stats: StageStats;
+  readonly routeDistance: number;
+  readonly routeProgress: number;
+  begin(): void;
+  step(player: PlayerState, dt: number): void;
+  restart(): void;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -468,18 +847,24 @@ export enum CameraMode {
   Orbit = 'orbit',
   Free = 'free',
   Fixed = 'fixed',
+  /** Framed on the boss, orbiting the arena. */
+  Boss = 'boss',
 }
 
 export interface ICameraDirector {
   readonly camera: PerspectiveCamera;
   mode: CameraMode;
+  /** The yaw the player's move input is relative to. */
+  readonly yaw: number;
   /** Called once per rendered frame, after physics. */
-  update(target: BikeState, dt: number, time: number): void;
-  /** Kick the camera — landing shake, crash shake, boost punch. */
+  update(target: PlayerState, dt: number, time: number): void;
+  /** Kick the camera — landing shake, hit shake, boost punch. */
   shake(amount: number, duration: number): void;
   fovKick(amount: number): void;
   /** Trigger the automatic big-air swing-around. */
   beginAirSwing(duration: number): void;
+  /** Frame a set piece or a boss opening. */
+  beginCinematic(name: string, duration: number): void;
   snapTo(position: Vector3, lookAt: Vector3): void;
   dispose(): void;
 }
@@ -489,12 +874,16 @@ export interface IEffects {
   update(dt: number, time: number, camera: Camera): void;
   /** Kick up a burst of cel dust. */
   dustBurst(position: Vector3, normal: Vector3, velocity: Vector3, amount: number, surface: SurfaceProperties): void;
-  /** Continuous dust from a sliding/rolling wheel. */
+  /** Continuous dust from running feet, a slide, or a grinding rail. */
   dustTrail(position: Vector3, normal: Vector3, velocity: Vector3, rate: number, surface: SurfaceProperties): void;
+  /** Sparks off a rail or a parried hit. */
+  sparkBurst(position: Vector3, direction: Vector3, amount: number, tint?: number): void;
   /** The anime impact hold: freeze + high-contrast flash for 1–2 frames. */
   impactFrame(intensity: number, tint?: number): void;
   /** Motion smear on a target for a short window. */
   smear(target: Object3D, amount: number): void;
+  /** Brief time dilation. Returns to 1.0 over `duration`. */
+  slowMotion(scale: number, duration: number): void;
   dispose(): void;
 }
 
@@ -502,35 +891,66 @@ export interface IEffects {
 // HUD + audio
 // ─────────────────────────────────────────────────────────────────────────────
 
+export interface HudPopup {
+  text: string;
+  value: number;
+  kind: 'combo' | 'pickup' | 'split' | 'warning' | 'style' | 'story';
+}
+
 export interface HudModel {
-  phase: RacePhase;
-  speedKmh: number;
-  position: number;
-  racerCount: number;
-  raceTime: number;
+  phase: StagePhase;
+  /** Display units — m/s × 2.5, the number Spark 3 itself shows. */
+  speedDisplay: number;
+  /** 0..1 of the run's top speed, for the needle and the speed FX. */
+  speedFraction: number;
+  mode: MoveMode;
+
+  /** Seconds left. The primary objective readout. */
+  timeLeft: number;
+  /** Seconds elapsed. */
+  time: number;
+  /** True when the clock is low enough to alarm. */
+  timeCritical: boolean;
+
+  health: number;
+  maxHealth: number;
   boost: number;
   boosting: boolean;
-  trickScore: number;
-  /** Currently-executing trick name, or null. */
-  activeTrick: string | null;
-  /** Score popups to show. The HUD consumes and clears these. */
-  popups: { text: string; value: number; kind: 'trick' | 'split' | 'warning' | 'combo' }[];
+
+  combo: number;
+  /** 0..1 of the combo window remaining, for the draining ring. */
+  comboWindow: number;
+  styleScore: number;
+  /** Style grade letter shown beside the combo. */
+  styleGrade: string;
+
+  fragments: number;
+  fragmentsTotal: number;
+  shards: number;
+  shardsTotal: number;
+
   /** Progress down the mountain, 0..1. */
   routeProgress: number;
-  /** Checkpoint splits, with deltas to the ghost. */
-  splits: { index: number; time: number | null; delta: number | null }[];
-  /** Signed gap to the racer ahead/behind, seconds. */
-  gapAhead: number | null;
-  gapBehind: number | null;
-  /** Preview of the next corner: signed curvature -1..1 and distance to it. */
-  cornerPreview: { curvature: number; distance: number } | null;
-  wrongWay: boolean;
-  countdown: number | null;
-  /** All racers for the position board. */
-  standings: RacerProgress[];
-  /** Live route profile: elevation samples and the player's marker. */
+  /** Live route profile for the descent widget. */
   routeProfile: Float32Array;
-  ghostDelta: number | null;
+  /** Current objective line. */
+  objective: string;
+  /** Contextual traversal prompt. */
+  prompt: TraversalPrompt;
+
+  /** Checkpoint splits, with deltas to the saved best. */
+  splits: { index: number; time: number | null; delta: number | null }[];
+  popups: HudPopup[];
+
+  /** Boss bar. Null when there is no boss. */
+  boss: { name: string; phase: BossPhase; health: number; phases: number; telegraph: number } | null;
+
+  /** A line of AI dialogue to type out, or null. */
+  transmission: string | null;
+
+  countdown: number | null;
+  results: StageStats | null;
+  wrongWay: boolean;
 }
 
 export interface IHud {
@@ -540,14 +960,25 @@ export interface IHud {
   dispose(): void;
 }
 
+export type MusicIntensity = 'explore' | 'traverse' | 'combat' | 'boss' | 'critical' | 'victory' | 'defeat';
+
 export interface IAudio {
   /** Must be called from a user gesture. */
   unlock(): Promise<void>;
-  update(state: BikeState, surface: SurfaceProperties, dt: number): void;
+  update(state: PlayerState, surface: SurfaceProperties, dt: number): void;
   playImpact(severity: number, surface: SurfaceProperties): void;
-  playSuspension(compressionVelocity: number): void;
+  playJump(doubleJump: boolean): void;
+  playDash(air: boolean): void;
+  playAttack(kind: AttackKind, combo: number): void;
+  playHit(killed: boolean, combo: number): void;
+  playRailMount(): void;
+  playWallMount(): void;
+  playPickup(kind: PickupKind, streak: number): void;
+  playStinger(kind: 'boss' | 'phase' | 'clear' | 'fail' | 'shortcut'): void;
   playStartHorn(pitch?: number): void;
   playUi(kind: 'tick' | 'confirm' | 'score' | 'checkpoint' | 'warning'): void;
+  /** Cross-fade the procedural score's layers. */
+  setMusicIntensity(kind: MusicIntensity): void;
   setMasterVolume(v: number): void;
   dispose(): void;
 }
@@ -579,7 +1010,7 @@ export interface ReplayFrame {
 }
 
 export interface IReplayRecorder {
-  record(t: number, state: BikeState): void;
+  record(t: number, state: PlayerState): void;
   /** The window around the biggest air of the run, for the results replay. */
   getBiggestAir(): { start: number; end: number; peak: number } | null;
   frames: ReplayFrame[];
