@@ -1,52 +1,98 @@
 /**
- * Rng — deterministic seeded random. Every generated thing in the game
- * traces back to one of these, so a seed string fully reproduces a stage.
+ * RNG — seeded, deterministic, cheap.
+ *
+ * The whole world is generated from seeds, so a given seed must always produce
+ * the same mountain, the same tree placement, the same rock scatter. That is
+ * what makes the capture harness able to photograph "the same frame" across
+ * builds, and what lets the ghost replay line up with the terrain it was set on.
+ *
+ * Never use Math.random() anywhere in world generation. Use a named stream.
  */
 
-/** FNV-1a string hash → 32-bit seed. */
-export function hashSeed(str: string): number {
+/** mulberry32 — small, fast, good enough distribution for scatter and noise. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Hash a string into a 32-bit seed, so streams can be named rather than numbered. */
+export function hashString(str: string): number {
   let h = 2166136261 >>> 0;
   for (let i = 0; i < str.length; i++) {
     h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
+    h = Math.imul(h, 16777619);
   }
   return h >>> 0;
 }
 
+/**
+ * A named random stream. Two streams with different names never correlate,
+ * which means adding a new scatter pass cannot shift the trees that already
+ * exist. This matters more than it sounds — without it, every tweak to one
+ * generator reshuffles the entire world and invalidates every captured frame.
+ */
 export class Rng {
-  private s: number;
+  private next01: () => number;
   readonly seed: number;
 
-  constructor(seed: number | string) {
-    this.seed = typeof seed === 'string' ? hashSeed(seed) : seed >>> 0;
-    this.s = this.seed || 0x9e3779b9;
+  constructor(seedOrName: number | string) {
+    this.seed = typeof seedOrName === 'string' ? hashString(seedOrName) : seedOrName >>> 0;
+    this.next01 = mulberry32(this.seed);
   }
 
-  /** mulberry32 — fast, decent distribution, tiny state. */
+  /** Derive a child stream — deterministic, independent of sibling usage. */
+  fork(name: string): Rng {
+    return new Rng((this.seed ^ hashString(name)) >>> 0);
+  }
+
+  /** Uniform [0,1). */
   next(): number {
-    this.s = (this.s + 0x6d2b79f5) >>> 0;
-    let t = this.s;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    return this.next01();
   }
 
-  /** Fork a child stream — lets subsystems consume randomness without desyncing siblings. */
-  fork(tag: string): Rng {
-    return new Rng((this.seed ^ hashSeed(tag) ^ (this.nextInt(0, 1 << 30) >>> 0)) >>> 0);
+  /** Uniform [min,max). */
+  range(min: number, max: number): number {
+    return min + this.next01() * (max - min);
   }
 
-  range(a: number, b: number) { return a + (b - a) * this.next(); }
-  nextInt(a: number, b: number) { return a + Math.floor(this.next() * (b - a + 1)); }
-  bool(p = 0.5) { return this.next() < p; }
-  sign() { return this.next() < 0.5 ? -1 : 1; }
-  pick<T>(arr: readonly T[]): T { return arr[Math.floor(this.next() * arr.length) % arr.length]; }
+  /** Uniform integer [min,max]. */
+  int(min: number, max: number): number {
+    return Math.floor(min + this.next01() * (max - min + 1));
+  }
 
-  /** Weighted pick. `weights` need not be normalized. */
-  weighted<T>(arr: readonly T[], weights: readonly number[]): T {
+  /** True with probability p. */
+  chance(p: number): boolean {
+    return this.next01() < p;
+  }
+
+  /** Symmetric [-1,1]. */
+  signed(): number {
+    return this.next01() * 2 - 1;
+  }
+
+  /** Approximately normal, mean 0, sd 1 — sum of 4 uniforms (fast, adequate). */
+  gaussian(): number {
+    let s = 0;
+    for (let i = 0; i < 4; i++) s += this.next01();
+    return (s - 2) * 1.732;
+  }
+
+  /** Pick one element. */
+  pick<T>(arr: readonly T[]): T {
+    return arr[Math.floor(this.next01() * arr.length) % arr.length];
+  }
+
+  /** Weighted pick. `weights` need not be normalised. */
+  pickWeighted<T>(arr: readonly T[], weights: readonly number[]): T {
     let total = 0;
-    for (let i = 0; i < arr.length; i++) total += weights[i];
-    let r = this.next() * total;
+    for (const w of weights) total += w;
+    let r = this.next01() * total;
     for (let i = 0; i < arr.length; i++) {
       r -= weights[i];
       if (r <= 0) return arr[i];
@@ -54,36 +100,30 @@ export class Rng {
     return arr[arr.length - 1];
   }
 
+  /** In-place Fisher–Yates. */
   shuffle<T>(arr: T[]): T[] {
     for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(this.next() * (i + 1));
-      const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+      const j = Math.floor(this.next01() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
     }
     return arr;
   }
 
-  /** Gaussian-ish via sum of uniforms — cheaper than Box-Muller, no trig. */
-  gauss(mean = 0, sd = 1) {
-    return mean + ((this.next() + this.next() + this.next() - 1.5) / 0.866) * sd;
+  /** A point uniformly inside the unit disc — used for scatter jitter. */
+  inDisc(): [number, number] {
+    const r = Math.sqrt(this.next01());
+    const a = this.next01() * Math.PI * 2;
+    return [Math.cos(a) * r, Math.sin(a) * r];
   }
 
-  /**
-   * Bag shuffle: draws from `arr` without repeats until exhausted, then reshuffles.
-   * This is the main tool against "obviously procedural" repetition.
-   */
-  bag<T>(arr: readonly T[]): () => T {
-    let pool: T[] = [];
-    let last: T | undefined;
-    return () => {
-      if (pool.length === 0) {
-        pool = this.shuffle(arr.slice());
-        // avoid the reshuffle immediately repeating the previous draw
-        if (pool.length > 1 && pool[pool.length - 1] === last) {
-          const t = pool[0]; pool[0] = pool[pool.length - 1]; pool[pool.length - 1] = t;
-        }
-      }
-      last = pool.pop()!;
-      return last;
-    };
+  /** A direction uniformly on the unit sphere — used for debris velocities. */
+  onSphere(): [number, number, number] {
+    const z = this.next01() * 2 - 1;
+    const a = this.next01() * Math.PI * 2;
+    const r = Math.sqrt(1 - z * z);
+    return [Math.cos(a) * r, Math.sin(a) * r, z];
   }
 }
+
+/** The one world seed. Change it and you get a different mountain. */
+export const WORLD_SEED = 0x5eed_10de;

@@ -1,154 +1,359 @@
 /**
- * Input — one place that owns "what is the player asking for this frame".
+ * Input — keyboard and gamepad, normalised into one analogue rider intent.
  *
- * Supports three sources that all resolve into the same `Intent`:
- *   1. keyboard      (physical)
- *   2. gamepad       (physical, analog)
- *   3. virtual       (a Set of action names pushed in by the capture harness)
+ * Two design points that matter downstream:
  *
- * When a virtual set is installed the physical sources are ignored entirely, so a
- * recorded input timeline replays frame-for-frame identically every run.
+ *  1. Digital keys are SMOOTHED into analogue axes with asymmetric attack and
+ *     release. A keyboard steer input that snaps from 0 to 1 makes the bike
+ *     feel like it is on rails; ramping it over ~110ms and releasing over ~70ms
+ *     gives keyboard players something close to a stick's feel without making
+ *     the controls sluggish.
+ *
+ *  2. Every button exposes `pressed`, `justPressed`, `justReleased` and a
+ *     `heldFor` timer. Preload-and-pump, bunny hop timing and trick input all
+ *     depend on *when* a button was released relative to a physics event, so
+ *     edge detection has to survive a frame in which several physics steps ran.
+ *
+ * The whole struct is also settable from outside, which is how the capture
+ * harness drives the game to an exact moment without touching the DOM.
  */
 
-export type Action =
-  | 'left' | 'right' | 'fwd' | 'back'
-  | 'jump' | 'dash' | 'attack' | 'boost' | 'pound' | 'special'
-  | 'camLeft' | 'camRight' | 'start' | 'restart' | 'debug';
+import { clamp, moveTowards } from './MathX';
 
-const KEYMAP: Record<string, Action> = {
-  KeyA: 'left', ArrowLeft: 'left',
-  KeyD: 'right', ArrowRight: 'right',
-  KeyW: 'fwd', ArrowUp: 'fwd',
-  KeyS: 'back', ArrowDown: 'back',
-  Space: 'jump',
-  ShiftLeft: 'dash', ShiftRight: 'dash',
-  KeyJ: 'attack', KeyK: 'attack', Enter: 'start',
-  KeyL: 'boost', KeyE: 'boost',
-  KeyC: 'pound', ControlLeft: 'pound',
-  KeyF: 'special', KeyQ: 'camLeft',
-  KeyR: 'restart',
-  Backquote: 'debug',
+export interface ButtonState {
+  pressed: boolean;
+  justPressed: boolean;
+  justReleased: boolean;
+  /** Seconds held. Reset to 0 on release. */
+  heldFor: number;
+  /** Seconds since the last release edge — for pump timing windows. */
+  sinceRelease: number;
+}
+
+function makeButton(): ButtonState {
+  return { pressed: false, justPressed: false, justReleased: false, heldFor: 0, sinceRelease: 999 };
+}
+
+/** The action set. Everything the rider can express. */
+export const ACTIONS = [
+  'steerLeft',
+  'steerRight',
+  'pedal',
+  'brakeRear',
+  'brakeFront',
+  'crouch',       // preload / manual / bunny-hop charge
+  'leanBack',
+  'leanForward',
+  'trick1',       // tailwhip / x-up modifier
+  'trick2',       // superman / tabletop modifier
+  'boost',
+  'reset',
+  'lookBack',
+  'pause',
+  'restart',
+  'toggleCam',
+  'toggleDebug',
+] as const;
+export type Action = (typeof ACTIONS)[number];
+
+const DEFAULT_BINDINGS: Record<string, Action> = {
+  KeyA: 'steerLeft',
+  ArrowLeft: 'steerLeft',
+  KeyD: 'steerRight',
+  ArrowRight: 'steerRight',
+  KeyW: 'pedal',
+  ArrowUp: 'pedal',
+  KeyS: 'brakeRear',
+  ArrowDown: 'brakeRear',
+  KeyQ: 'brakeFront',
+  Space: 'crouch',
+  KeyJ: 'leanBack',
+  KeyK: 'leanForward',
+  ShiftLeft: 'trick1',
+  ShiftRight: 'trick1',
+  KeyE: 'trick2',
+  KeyF: 'boost',
+  KeyR: 'reset',
+  KeyC: 'lookBack',
+  Escape: 'pause',
+  Enter: 'restart',
+  KeyV: 'toggleCam',
+  Backquote: 'toggleDebug',
 };
 
-export interface Intent {
-  /** Stick / WASD direction in camera space, magnitude 0..1. */
-  moveX: number;
-  moveY: number;
-  moveMag: number;
-  /** True while the analog stick / keys are pushed past the walk threshold. */
-  moving: boolean;
+/** Smoothed analogue rider intent, consumed by the bike and rider systems. */
+export interface RiderIntent {
+  /** -1 (left) .. +1 (right). Smoothed. */
+  steer: number;
+  /** 0..1 pedal effort. */
+  pedal: number;
+  /** 0..1 rear brake. */
+  brakeRear: number;
+  /** 0..1 front brake. */
+  brakeFront: number;
+  /** 0..1 crouch/compression. This is the preload channel. */
+  crouch: number;
+  /** -1 (forward over the bars) .. +1 (back, manual). */
+  pitchLean: number;
+  /** Raw button states for edge-sensitive logic. */
+  buttons: Record<Action, ButtonState>;
+  /** True while any gamepad is providing input — HUD swaps its prompts. */
+  usingGamepad: boolean;
 }
 
 export class Input {
-  readonly intent: Intent = { moveX: 0, moveY: 0, moveMag: 0, moving: false };
+  readonly intent: RiderIntent;
+  private down = new Set<string>();
+  private pressedThisFrame = new Set<string>();
+  private releasedThisFrame = new Set<string>();
+  private bindings: Record<string, Action>;
+  private enabled = true;
+  /** When true, all hardware input is ignored and the harness drives `intent`. */
+  scripted = false;
+  private gamepadIndex: number | null = null;
 
-  private down = new Set<Action>();
-  private prev = new Set<Action>();
-  private pressedAt = new Map<Action, number>();
-  private releasedAt = new Map<Action, number>();
-  private virtual: Set<Action> | null = null;
-  private virtualAxis: { x: number; y: number } | null = null;
-  private time = 0;
-  private padIndex = -1;
-  /** Set by the harness so gamepad polling can be skipped deterministically. */
-  deterministic = false;
+  constructor(target: HTMLElement | Window = window, bindings = DEFAULT_BINDINGS) {
+    this.bindings = bindings;
+    const buttons = {} as Record<Action, ButtonState>;
+    for (const a of ACTIONS) buttons[a] = makeButton();
+    this.intent = {
+      steer: 0,
+      pedal: 0,
+      brakeRear: 0,
+      brakeFront: 0,
+      crouch: 0,
+      pitchLean: 0,
+      buttons,
+      usingGamepad: false,
+    };
 
-  constructor(target: EventTarget = window) {
-    target.addEventListener('keydown', this.onKey as EventListener);
-    target.addEventListener('keyup', this.onKey as EventListener);
-    window.addEventListener('blur', () => this.down.clear());
-    window.addEventListener('gamepadconnected', (e) => {
-      this.padIndex = (e as GamepadEvent).gamepad.index;
-    });
-    window.addEventListener('gamepaddisconnected', () => { this.padIndex = -1; });
+    const el = target as Window;
+    el.addEventListener('keydown', this.onKeyDown as EventListener);
+    el.addEventListener('keyup', this.onKeyUp as EventListener);
+    window.addEventListener('blur', this.onBlur);
+    window.addEventListener('gamepadconnected', this.onGamepadConnected as EventListener);
+    window.addEventListener('gamepaddisconnected', this.onGamepadDisconnected as EventListener);
   }
 
-  private onKey = (e: KeyboardEvent) => {
-    const a = KEYMAP[e.code];
-    // Space / arrows must not scroll the page.
-    if (a) e.preventDefault();
-    if (!a || this.virtual) return;
-    if (e.type === 'keydown') { if (!e.repeat) this.down.add(a); }
-    else this.down.delete(a);
+  private onKeyDown = (e: KeyboardEvent): void => {
+    if (!this.enabled || this.scripted) return;
+    if (e.repeat) return;
+    if (this.bindings[e.code]) {
+      e.preventDefault();
+      this.down.add(e.code);
+      this.pressedThisFrame.add(e.code);
+      this.intent.usingGamepad = false;
+    }
   };
 
-  /** Harness entry point. Pass null to hand control back to the keyboard. */
-  setVirtual(actions: Action[] | null, axis?: { x: number; y: number }) {
-    if (actions === null) { this.virtual = null; this.virtualAxis = null; return; }
-    this.virtual = new Set(actions);
-    this.virtualAxis = axis ?? null;
-    this.deterministic = true;
+  private onKeyUp = (e: KeyboardEvent): void => {
+    if (!this.enabled || this.scripted) return;
+    if (this.bindings[e.code]) {
+      e.preventDefault();
+      this.down.delete(e.code);
+      this.releasedThisFrame.add(e.code);
+    }
+  };
+
+  /** Losing focus mid-input would otherwise leave a key stuck down forever. */
+  private onBlur = (): void => {
+    for (const code of this.down) this.releasedThisFrame.add(code);
+    this.down.clear();
+  };
+
+  private onGamepadConnected = (e: GamepadEvent): void => {
+    this.gamepadIndex = e.gamepad.index;
+  };
+
+  private onGamepadDisconnected = (e: GamepadEvent): void => {
+    if (this.gamepadIndex === e.gamepad.index) this.gamepadIndex = null;
+  };
+
+  private isActionDown(a: Action): boolean {
+    for (const code in this.bindings) {
+      if (this.bindings[code] === a && this.down.has(code)) return true;
+    }
+    return false;
   }
 
-  /** Call once per frame BEFORE any consumer reads state. */
-  update(dt: number) {
-    this.time += dt;
+  private wasActionPressed(a: Action): boolean {
+    for (const code of this.pressedThisFrame) if (this.bindings[code] === a) return true;
+    return false;
+  }
 
-    this.prev.clear();
-    for (const a of this.down) this.prev.add(a);
+  private wasActionReleased(a: Action): boolean {
+    for (const code of this.releasedThisFrame) if (this.bindings[code] === a) return true;
+    return false;
+  }
 
-    let src = this.down;
-    if (this.virtual) {
-      // Rebuild `down` from the virtual set so edge detection still works.
-      this.down = new Set(this.virtual);
-      src = this.down;
+  /** Call once per frame, before the fixed-update loop. */
+  update(dt: number): void {
+    if (this.scripted) {
+      this.updateButtonTimers(dt);
+      return;
     }
 
-    // edge bookkeeping
-    for (const a of src) if (!this.prev.has(a)) this.pressedAt.set(a, this.time);
-    for (const a of this.prev) if (!src.has(a)) this.releasedAt.set(a, this.time);
+    const pad = this.pollGamepad();
 
-    let ax = 0, ay = 0;
-    if (this.virtualAxis) { ax = this.virtualAxis.x; ay = this.virtualAxis.y; }
-    else {
-      if (src.has('left')) ax -= 1;
-      if (src.has('right')) ax += 1;
-      if (src.has('fwd')) ay += 1;
-      if (src.has('back')) ay -= 1;
-      if (!this.virtual && !this.deterministic && this.padIndex >= 0) {
-        const pad = navigator.getGamepads?.()[this.padIndex];
-        if (pad) {
-          const dx = dz(pad.axes[0] ?? 0), dy = dz(-(pad.axes[1] ?? 0));
-          if (Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01) { ax = dx; ay = dy; }
-          this.padButton(pad, 0, 'jump'); this.padButton(pad, 2, 'attack');
-          this.padButton(pad, 1, 'dash'); this.padButton(pad, 3, 'special');
-          this.padButton(pad, 5, 'boost'); this.padButton(pad, 7, 'boost');
-          this.padButton(pad, 6, 'pound'); this.padButton(pad, 9, 'start');
-        }
+    for (const a of ACTIONS) {
+      const b = this.intent.buttons[a];
+      const wasPressed = b.pressed;
+      const nowPressed = this.isActionDown(a) || (pad ? padActionDown(pad, a) : false);
+
+      b.justPressed = (!wasPressed && nowPressed) || this.wasActionPressed(a);
+      b.justReleased = (wasPressed && !nowPressed) || this.wasActionReleased(a);
+      b.pressed = nowPressed;
+
+      if (nowPressed) {
+        b.heldFor += dt;
+        b.sinceRelease = 0;
+      } else {
+        if (wasPressed) b.heldFor = 0;
+        b.sinceRelease += dt;
       }
     }
 
-    const m = Math.hypot(ax, ay);
-    if (m > 1) { ax /= m; ay /= m; }
-    const it = this.intent;
-    it.moveX = ax; it.moveY = ay;
-    it.moveMag = Math.min(1, m);
-    it.moving = it.moveMag > 0.16;
+    this.pressedThisFrame.clear();
+    this.releasedThisFrame.clear();
+
+    // ── Analogue synthesis ──────────────────────────────────────────────────
+    const i = this.intent;
+
+    if (pad) {
+      // A real stick bypasses the keyboard smoothing entirely — the player is
+      // already providing the curve with their thumb.
+      const ax = deadzone(pad.axes[0] ?? 0, 0.12);
+      i.steer = clamp(ax, -1, 1);
+      i.pedal = Math.max(triggerValue(pad, 7), padActionDown(pad, 'pedal') ? 1 : 0);
+      i.brakeRear = Math.max(triggerValue(pad, 6), padActionDown(pad, 'brakeRear') ? 1 : 0);
+      i.brakeFront = padActionDown(pad, 'brakeFront') ? 1 : 0;
+      i.crouch = padActionDown(pad, 'crouch') ? 1 : 0;
+      i.pitchLean = clamp(-(deadzone(pad.axes[1] ?? 0, 0.15)), -1, 1);
+      i.usingGamepad = true;
+    } else {
+      const steerTarget = (i.buttons.steerRight.pressed ? 1 : 0) - (i.buttons.steerLeft.pressed ? 1 : 0);
+      // Asymmetric: ~60ms to full lock, ~55ms to centre. Quick to release so
+      // corrections feel sharp; slower to engage so the bike doesn't snap.
+      const attack = dt / 0.06;
+      const release = dt / 0.055;
+      i.steer =
+        steerTarget === 0
+          ? moveTowards(i.steer, 0, release)
+          : moveTowards(i.steer, steerTarget, attack);
+
+      i.pedal = moveTowards(i.pedal, i.buttons.pedal.pressed ? 1 : 0, dt / (i.buttons.pedal.pressed ? 0.09 : 0.16));
+      i.brakeRear = moveTowards(i.brakeRear, i.buttons.brakeRear.pressed ? 1 : 0, dt / 0.06);
+      i.brakeFront = moveTowards(i.brakeFront, i.buttons.brakeFront.pressed ? 1 : 0, dt / 0.06);
+      // Crouch attacks fast (you can slam into a preload) and releases very
+      // fast (the pop off the lip must be instantaneous to feel like a pump).
+      i.crouch = moveTowards(i.crouch, i.buttons.crouch.pressed ? 1 : 0, dt / (i.buttons.crouch.pressed ? 0.07 : 0.035));
+
+      const leanTarget = (i.buttons.leanBack.pressed ? 1 : 0) - (i.buttons.leanForward.pressed ? 1 : 0);
+      i.pitchLean = moveTowards(i.pitchLean, leanTarget, dt / 0.12);
+    }
   }
 
-  private padButton(pad: Gamepad, i: number, a: Action) {
-    if (pad.buttons[i]?.pressed) this.down.add(a); else this.down.delete(a);
+  private updateButtonTimers(dt: number): void {
+    for (const a of ACTIONS) {
+      const b = this.intent.buttons[a];
+      if (b.pressed) {
+        b.heldFor += dt;
+        b.sinceRelease = 0;
+      } else {
+        b.sinceRelease += dt;
+      }
+    }
   }
 
-  held(a: Action) { return this.down.has(a); }
-  pressed(a: Action) { return this.down.has(a) && !this.prev.has(a); }
-  released(a: Action) { return !this.down.has(a) && this.prev.has(a); }
-
-  /**
-   * True if the action was pressed within `window` seconds and hasn't been consumed.
-   * This is what makes jumps feel forgiving at 60fps.
-   */
-  buffered(a: Action, window = 0.13) {
-    const t = this.pressedAt.get(a);
-    return t !== undefined && this.time - t <= window;
+  private pollGamepad(): Gamepad | null {
+    const pads = navigator.getGamepads?.() ?? [];
+    if (this.gamepadIndex !== null) {
+      const p = pads[this.gamepadIndex];
+      if (p && p.connected) return p;
+    }
+    for (const p of pads) {
+      if (p && p.connected) {
+        this.gamepadIndex = p.index;
+        return p;
+      }
+    }
+    return null;
   }
-  consume(a: Action) { this.pressedAt.delete(a); }
-  anyPressed() { for (const a of this.down) if (!this.prev.has(a)) return true; return false; }
-  clear() { this.down.clear(); this.prev.clear(); this.pressedAt.clear(); }
+
+  /** Used by the capture harness and the AI-controlled demo attract mode. */
+  setScripted(on: boolean): void {
+    this.scripted = on;
+    if (on) {
+      this.down.clear();
+      const i = this.intent;
+      i.steer = i.pedal = i.brakeRear = i.brakeFront = i.crouch = i.pitchLean = 0;
+      for (const a of ACTIONS) {
+        const b = i.buttons[a];
+        b.pressed = b.justPressed = b.justReleased = false;
+      }
+    }
+  }
+
+  /** Programmatically press/release, for scripted playback. */
+  scriptButton(a: Action, pressed: boolean): void {
+    const b = this.intent.buttons[a];
+    if (pressed && !b.pressed) b.justPressed = true;
+    if (!pressed && b.pressed) b.justReleased = true;
+    b.pressed = pressed;
+  }
+
+  /** Clear all justPressed/justReleased edges. Call at the end of a frame. */
+  clearEdges(): void {
+    for (const a of ACTIONS) {
+      const b = this.intent.buttons[a];
+      b.justPressed = false;
+      b.justReleased = false;
+    }
+  }
+
+  setEnabled(on: boolean): void {
+    this.enabled = on;
+    if (!on) this.onBlur();
+  }
+
+  dispose(): void {
+    window.removeEventListener('keydown', this.onKeyDown as EventListener);
+    window.removeEventListener('keyup', this.onKeyUp as EventListener);
+    window.removeEventListener('blur', this.onBlur);
+    window.removeEventListener('gamepadconnected', this.onGamepadConnected as EventListener);
+    window.removeEventListener('gamepaddisconnected', this.onGamepadDisconnected as EventListener);
+  }
 }
 
-const dz = (v: number) => {
+// ── Gamepad helpers ──────────────────────────────────────────────────────────
+function deadzone(v: number, dz: number): number {
   const a = Math.abs(v);
-  if (a < 0.22) return 0;
-  return Math.sign(v) * ((a - 0.22) / 0.78) ** 1.4;
+  if (a < dz) return 0;
+  return Math.sign(v) * ((a - dz) / (1 - dz));
+}
+
+function triggerValue(pad: Gamepad, index: number): number {
+  const b = pad.buttons[index];
+  return b ? b.value : 0;
+}
+
+/** Standard-mapping gamepad layout. */
+const PAD_MAP: Partial<Record<Action, number>> = {
+  crouch: 0,        // A / cross
+  trick1: 2,        // X / square
+  trick2: 3,        // Y / triangle
+  boost: 1,         // B / circle
+  brakeFront: 4,    // LB
+  pedal: 5,         // RB (also RT via trigger)
+  lookBack: 10,
+  reset: 8,
+  pause: 9,
+  toggleCam: 11,
 };
+
+function padActionDown(pad: Gamepad, a: Action): boolean {
+  const idx = PAD_MAP[a];
+  if (idx === undefined) return false;
+  const b = pad.buttons[idx];
+  return !!b && b.pressed;
+}
