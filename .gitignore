@@ -1,38 +1,15 @@
-# dependencies
 node_modules/
-.pnp
-.pnp.js
-
-# build output
 dist/
-dist-ssr/
-build/
-*.local
-
-# env
-.env
-.env.local
-.env.*.local
-
-# logs
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# editors
-.vscode/*
-!.vscode/extensions.json
-.idea/
-*.swp
-*.swo
-
-# os
 .DS_Store
-Thumbs.db
+*.log
 
-# blender working files (source .blend, not the exported .glb in public/models)
-*.blend1
-*.blend2
+# Review artefacts. These are REGENERATED, never authored:
+#   node tools/capture/capture.mjs --poses
+#   node tools/capture/capture.mjs --seq all
+# They were 225 MB of a 280 MB repository, which is 225 MB cloned on every
+# deploy for images nothing in the build reads.
+captures/
+tools/capture/_out/
+
+# Claude Code local state and agent worktrees.
+.claude/

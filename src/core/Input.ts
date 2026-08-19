@@ -1,144 +1,391 @@
-import { clamp } from './MathX';
+/**
+ * Input — keyboard and gamepad, normalised into one player intent.
+ *
+ * ── WHAT THE PIVOT CHANGED HERE ─────────────────────────────────────────────
+ * This was a bike's control surface: a smoothed steering axis, a pedal, two
+ * independent brakes, a preload channel and a pitch-lean axis. A platformer
+ * wants none of those. It wants a MOVE VECTOR in camera space plus six
+ * discrete verbs, so that is what this now produces.
+ *
+ * Two design points that matter downstream:
+ *
+ *  1. THE MOVE AXES SNAP. They are not smoothed, and that is a reversal of the
+ *     old file's first design point — deliberately.
+ *
+ *     `PlayerPhysics` reads `hypot(moveX, moveZ)` as the player's INTENT
+ *     magnitude: "half stick is a jog rather than a slow sprint". So ramping a
+ *     keyboard press from 0 to 1 over 60 ms does not soften the start, it tells
+ *     the physics the player wants to jog for 60 ms and then sprint. At
+ *     `GRAVITY.accel`-scale acceleration that is most of a metre surrendered
+ *     off every standing start, and it is a lie about what the player asked for.
+ *
+ *     Smoothing was right for a steering axis, where the smoothing WAS the
+ *     handling model and a snap read as being on rails. It is wrong for a run
+ *     vector, because the equivalent softening already exists downstream and in
+ *     the right place: the physics slews `facing` toward the wish direction at
+ *     `RUN.turnRateLow`..`turnRateHigh` (12 rad/s dropping to 2.2 at top
+ *     speed), so a hard 90-degree input change is a carved corner, not a
+ *     teleport. Smoothing here would be a second, uncalibrated turn limiter in
+ *     front of the tuned one.
+ *
+ *     A real stick still supplies its own curve and is passed through
+ *     untouched, deadzone aside.
+ *
+ *  2. Every button exposes `pressed`, `justPressed`, `justReleased` and a
+ *     `heldFor` timer, and the edges SURVIVE A FRAME IN WHICH SEVERAL PHYSICS
+ *     STEPS RAN. That is load-bearing here: physics runs at a fixed 120 Hz and
+ *     a rendered frame consumes two or more steps, so `Game` converts an edge
+ *     into a single-step pulse itself. See `Game.buildPlayerInput`.
+ *
+ * The whole struct is also settable from outside, which is how the capture
+ * harness drives the game to an exact moment without touching the DOM.
+ */
 
-export type Action =
-  | 'jump' | 'dash' | 'attack' | 'boost' | 'slide' | 'start' | 'back'
-  | 'camLeft' | 'camRight' | 'restart';
+export interface ButtonState {
+  pressed: boolean;
+  justPressed: boolean;
+  justReleased: boolean;
+  /** Seconds held. Reset to 0 on release. */
+  heldFor: number;
+  /** Seconds since the last release edge — for buffered-input windows. */
+  sinceRelease: number;
+}
 
-const ACTIONS: Action[] = ['jump', 'dash', 'attack', 'boost', 'slide', 'start', 'back', 'camLeft', 'camRight', 'restart'];
+function makeButton(): ButtonState {
+  return { pressed: false, justPressed: false, justReleased: false, heldFor: 0, sinceRelease: 999 };
+}
 
-const KEY_MAP: Record<string, Action[]> = {
-  Space: ['jump'],
-  KeyZ: ['jump'],
-  ShiftLeft: ['dash'],
-  ShiftRight: ['dash'],
-  KeyX: ['dash'],
-  KeyC: ['attack'],
-  KeyJ: ['attack'],
-  KeyV: ['boost'],
-  KeyK: ['boost'],
-  ControlLeft: ['slide'],
-  KeyS_slide: ['slide'],
-  KeyL: ['slide'],
-  Enter: ['start'],
-  NumpadEnter: ['start'],
-  Escape: ['back'],
-  KeyQ: ['camLeft'],
-  KeyE: ['camRight'],
-  KeyR: ['restart'],
+/**
+ * The action set. Everything the player can express.
+ *
+ * `crouch` is the slide: held on the ground it drops the hull and trades grip
+ * for gradient, which is why it is a level and not a verb. `dive` is the
+ * down-dash that resolves into a ground pound, and is deliberately a separate
+ * action from `dash` rather than dash-plus-down — a modifier combination is
+ * unreachable at 74 m/s.
+ */
+export const ACTIONS = [
+  'moveForward',
+  'moveBack',
+  'moveLeft',
+  'moveRight',
+  'jump',
+  'dash',
+  'attack',
+  'crouch',       // slide / low hull
+  'boost',
+  'dive',         // down-dash into a ground pound
+  'reset',
+  'lookBack',
+  'pause',
+  'restart',
+  'toggleCam',
+  'toggleDebug',
+] as const;
+export type Action = (typeof ACTIONS)[number];
+
+const DEFAULT_BINDINGS: Record<string, Action> = {
+  KeyW: 'moveForward',
+  ArrowUp: 'moveForward',
+  KeyS: 'moveBack',
+  ArrowDown: 'moveBack',
+  KeyA: 'moveLeft',
+  ArrowLeft: 'moveLeft',
+  KeyD: 'moveRight',
+  ArrowRight: 'moveRight',
+  Space: 'jump',
+  ShiftLeft: 'dash',
+  ShiftRight: 'dash',
+  KeyJ: 'attack',
+  ControlLeft: 'crouch',
+  KeyC: 'crouch',
+  KeyF: 'boost',
+  KeyK: 'dive',
+  KeyR: 'reset',
+  KeyB: 'lookBack',
+  Escape: 'pause',
+  Enter: 'restart',
+  KeyV: 'toggleCam',
+  Backquote: 'toggleDebug',
 };
 
 /**
- * Input hub. Three sources feed the same state: keyboard, gamepad, and a scripted
- * channel used by the screenshot harness so deterministic input sequences can be
- * replayed frame for frame after a fix.
+ * Player intent, consumed by `Game` and turned into a `PlayerInput`.
+ *
+ * The move vector is in CAMERA space and is not yet resolved against a yaw —
+ * that is `Game`'s job, because the camera is the only thing that knows which
+ * way it is pointing and this class must not depend on it.
  */
-export class Input {
-  moveX = 0;
-  moveY = 0;
-  private down = new Set<Action>();
-  private pressedThisFrame = new Set<Action>();
-  private releasedThisFrame = new Set<Action>();
-  private keys = new Set<string>();
-  private scripted: { down: Set<Action>; moveX: number; moveY: number } | null = null;
-  private padIndex = -1;
-  anyInputSeen = false;
-  pointerLocked = false;
+export interface PlayerIntent {
+  /** -1 (left) .. +1 (right), camera space. */
+  moveX: number;
+  /** -1 (toward the camera) .. +1 (away from it), camera space. */
+  moveZ: number;
+  /** Raw button states for edge-sensitive logic. */
+  buttons: Record<Action, ButtonState>;
+  /** True while any gamepad is providing input — HUD swaps its prompts. */
+  usingGamepad: boolean;
+}
 
-  constructor(private target: HTMLElement) {
-    window.addEventListener('keydown', this.onKeyDown, { passive: false });
-    window.addEventListener('keyup', this.onKeyUp);
-    window.addEventListener('blur', () => { this.keys.clear(); this.down.clear(); });
-    window.addEventListener('gamepadconnected', (e: any) => { this.padIndex = e.gamepad.index; });
-    window.addEventListener('gamepaddisconnected', () => { this.padIndex = -1; });
-    target.addEventListener('pointerdown', () => { this.anyInputSeen = true; this.pressScripted('start'); });
-    // Harness hook: window.__input.set({ moveY: 1, jump: true })
-    (window as any).__input = {
-      set: (o: any) => {
-        if (!this.scripted) this.scripted = { down: new Set(), moveX: 0, moveY: 0 };
-        if (o.moveX !== undefined) this.scripted.moveX = o.moveX;
-        if (o.moveY !== undefined) this.scripted.moveY = o.moveY;
-        for (const a of ACTIONS) if (o[a] !== undefined) { if (o[a]) this.scripted.down.add(a); else this.scripted.down.delete(a); }
-      },
-      clear: () => { this.scripted = null; },
-      tap: (a: Action) => { this.pressScripted(a); },
+export class Input {
+  readonly intent: PlayerIntent;
+  private down = new Set<string>();
+  private pressedThisFrame = new Set<string>();
+  private releasedThisFrame = new Set<string>();
+  private bindings: Record<string, Action>;
+  private enabled = true;
+  /** When true, all hardware input is ignored and the harness drives `intent`. */
+  scripted = false;
+  private gamepadIndex: number | null = null;
+
+  constructor(target: HTMLElement | Window = window, bindings = DEFAULT_BINDINGS) {
+    this.bindings = bindings;
+    const buttons = {} as Record<Action, ButtonState>;
+    for (const a of ACTIONS) buttons[a] = makeButton();
+    this.intent = {
+      moveX: 0,
+      moveZ: 0,
+      buttons,
+      usingGamepad: false,
     };
+
+    const el = target as Window;
+    el.addEventListener('keydown', this.onKeyDown as EventListener);
+    el.addEventListener('keyup', this.onKeyUp as EventListener);
+    window.addEventListener('blur', this.onBlur);
+    window.addEventListener('gamepadconnected', this.onGamepadConnected as EventListener);
+    window.addEventListener('gamepaddisconnected', this.onGamepadDisconnected as EventListener);
   }
 
-  private queuedTaps: Action[] = [];
-  private pressScripted(a: Action) { this.queuedTaps.push(a); }
-
-  private onKeyDown = (e: KeyboardEvent) => {
+  private onKeyDown = (e: KeyboardEvent): void => {
+    if (!this.enabled || this.scripted) return;
     if (e.repeat) return;
-    this.anyInputSeen = true;
-    if (e.code === 'Space' || e.code.startsWith('Arrow') || e.code === 'Tab') e.preventDefault();
-    this.keys.add(e.code);
-    const acts = KEY_MAP[e.code];
-    if (acts) for (const a of acts) { this.down.add(a); this.pressedThisFrame.add(a); }
+    if (this.bindings[e.code]) {
+      e.preventDefault();
+      this.down.add(e.code);
+      this.pressedThisFrame.add(e.code);
+      this.intent.usingGamepad = false;
+    }
   };
 
-  private onKeyUp = (e: KeyboardEvent) => {
-    this.keys.delete(e.code);
-    const acts = KEY_MAP[e.code];
-    if (acts) for (const a of acts) { this.down.delete(a); this.releasedThisFrame.add(a); }
+  private onKeyUp = (e: KeyboardEvent): void => {
+    if (!this.enabled || this.scripted) return;
+    if (this.bindings[e.code]) {
+      e.preventDefault();
+      this.down.delete(e.code);
+      this.releasedThisFrame.add(e.code);
+    }
   };
 
-  /** Called once per frame before gameplay update. */
-  poll() {
+  /** Losing focus mid-input would otherwise leave a key stuck down forever. */
+  private onBlur = (): void => {
+    for (const code of this.down) this.releasedThisFrame.add(code);
+    this.down.clear();
+  };
+
+  private onGamepadConnected = (e: GamepadEvent): void => {
+    this.gamepadIndex = e.gamepad.index;
+  };
+
+  private onGamepadDisconnected = (e: GamepadEvent): void => {
+    if (this.gamepadIndex === e.gamepad.index) this.gamepadIndex = null;
+  };
+
+  private isActionDown(a: Action): boolean {
+    for (const code in this.bindings) {
+      if (this.bindings[code] === a && this.down.has(code)) return true;
+    }
+    return false;
+  }
+
+  private wasActionPressed(a: Action): boolean {
+    for (const code of this.pressedThisFrame) if (this.bindings[code] === a) return true;
+    return false;
+  }
+
+  private wasActionReleased(a: Action): boolean {
+    for (const code of this.releasedThisFrame) if (this.bindings[code] === a) return true;
+    return false;
+  }
+
+  /** Call once per frame, before the fixed-update loop. */
+  update(dt: number): void {
+    if (this.scripted) {
+      this.updateButtonTimers(dt);
+      // The move vector is synthesised in scripted mode too.
+      //
+      // It used to be skipped, on the assumption that a scripted caller writes
+      // the analogue channels directly — which was true of the bike, whose
+      // harness set `intent.steer` and `intent.pedal` by hand. It is a trap
+      // here: `scriptButton('moveForward', true)` is the obvious way to drive
+      // the game from a test, it moves a button the physics never reads, and
+      // the failure is silent — a character that will not walk, with a pressed
+      // button to prove it should. Measured: 2 s of held `moveForward` produced
+      // 0.1 m/s.
+      //
+      // A caller that wants the raw axes writes them AFTER `update()`, which is
+      // where a per-frame override has to go regardless.
+      this.synthMoveFromButtons();
+      return;
+    }
+
+    const pad = this.pollGamepad();
+
+    for (const a of ACTIONS) {
+      const b = this.intent.buttons[a];
+      const wasPressed = b.pressed;
+      const nowPressed = this.isActionDown(a) || (pad ? padActionDown(pad, a) : false);
+
+      b.justPressed = (!wasPressed && nowPressed) || this.wasActionPressed(a);
+      b.justReleased = (wasPressed && !nowPressed) || this.wasActionReleased(a);
+      b.pressed = nowPressed;
+
+      if (nowPressed) {
+        b.heldFor += dt;
+        b.sinceRelease = 0;
+      } else {
+        if (wasPressed) b.heldFor = 0;
+        b.sinceRelease += dt;
+      }
+    }
+
     this.pressedThisFrame.clear();
     this.releasedThisFrame.clear();
 
-    for (const a of this.queuedTaps) { this.pressedThisFrame.add(a); }
-    this.queuedTaps.length = 0;
+    // ── The move vector ─────────────────────────────────────────────────────
+    const i = this.intent;
 
-    let x = 0, y = 0;
-    if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) x -= 1;
-    if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) x += 1;
-    if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) y += 1;
-    if (this.keys.has('KeyS') || this.keys.has('ArrowDown')) y -= 1;
+    if (pad) {
+      // A real stick bypasses everything — the player is already providing the
+      // curve with their thumb. Y is inverted because a stick pushed AWAY from
+      // the player reads negative and means "away from the camera".
+      i.moveX = deadzone(pad.axes[0] ?? 0, 0.12);
+      i.moveZ = -deadzone(pad.axes[1] ?? 0, 0.12);
+      i.usingGamepad = true;
+    } else {
+      this.synthMoveFromButtons();
+    }
+  }
 
-    if (this.padIndex >= 0 && navigator.getGamepads) {
-      const pad = navigator.getGamepads()[this.padIndex];
-      if (pad) {
-        const dz = (v: number) => (Math.abs(v) < 0.18 ? 0 : v);
-        x += dz(pad.axes[0] || 0);
-        y -= dz(pad.axes[1] || 0);
-        const btn = (i: number) => !!(pad.buttons[i] && pad.buttons[i].pressed);
-        this.setHeld('jump', btn(0));
-        this.setHeld('attack', btn(2));
-        this.setHeld('dash', btn(1) || btn(7));
-        this.setHeld('boost', btn(3) || btn(6));
-        this.setHeld('slide', btn(5) || btn(4));
-        this.setHeld('start', btn(9));
-        this.setHeld('back', btn(8));
+  /**
+   * The keyboard move vector: snapped, not smoothed. See design point 1 in the
+   * header for why there is no ramp here.
+   *
+   * A diagonal is left at magnitude 1.41 rather than normalised, and that is not
+   * an oversight: `PlayerPhysics` clamps `wishMag` to 1 itself, so normalising
+   * would be a second clamp, and a caller that wants the raw pressed pair (a
+   * debug overlay, a replay diff) would have lost it.
+   */
+  private synthMoveFromButtons(): void {
+    const i = this.intent;
+    i.moveX = (i.buttons.moveRight.pressed ? 1 : 0) - (i.buttons.moveLeft.pressed ? 1 : 0);
+    i.moveZ = (i.buttons.moveForward.pressed ? 1 : 0) - (i.buttons.moveBack.pressed ? 1 : 0);
+  }
+
+  private updateButtonTimers(dt: number): void {
+    for (const a of ACTIONS) {
+      const b = this.intent.buttons[a];
+      if (b.pressed) {
+        b.heldFor += dt;
+        b.sinceRelease = 0;
+      } else {
+        b.sinceRelease += dt;
       }
     }
+  }
 
-    if (this.scripted) {
-      x = this.scripted.moveX;
-      y = this.scripted.moveY;
+  private pollGamepad(): Gamepad | null {
+    const pads = navigator.getGamepads?.() ?? [];
+    if (this.gamepadIndex !== null) {
+      const p = pads[this.gamepadIndex];
+      if (p && p.connected) return p;
+    }
+    for (const p of pads) {
+      if (p && p.connected) {
+        this.gamepadIndex = p.index;
+        return p;
+      }
+    }
+    return null;
+  }
+
+  /** Used by the capture harness and the scripted attract mode. */
+  setScripted(on: boolean): void {
+    this.scripted = on;
+    if (on) {
+      this.down.clear();
+      const i = this.intent;
+      i.moveX = 0;
+      i.moveZ = 0;
       for (const a of ACTIONS) {
-        const held = this.scripted.down.has(a);
-        this.setHeld(a, held);
+        const b = i.buttons[a];
+        b.pressed = b.justPressed = b.justReleased = false;
       }
     }
-
-    const len = Math.hypot(x, y);
-    if (len > 1) { x /= len; y /= len; }
-    this.moveX = clamp(x, -1, 1);
-    this.moveY = clamp(y, -1, 1);
   }
 
-  private prevHeld = new Set<Action>();
-  private setHeld(a: Action, held: boolean) {
-    const was = this.prevHeld.has(a);
-    if (held && !was) this.pressedThisFrame.add(a);
-    if (!held && was) this.releasedThisFrame.add(a);
-    if (held) { this.down.add(a); this.prevHeld.add(a); }
-    else { this.prevHeld.delete(a); if (this.scripted || this.padIndex >= 0) this.down.delete(a); }
+  /** Programmatically press/release, for scripted playback. */
+  scriptButton(a: Action, pressed: boolean): void {
+    const b = this.intent.buttons[a];
+    if (pressed && !b.pressed) b.justPressed = true;
+    if (!pressed && b.pressed) b.justReleased = true;
+    b.pressed = pressed;
   }
 
-  held(a: Action) { return this.down.has(a); }
-  pressed(a: Action) { return this.pressedThisFrame.has(a); }
-  released(a: Action) { return this.releasedThisFrame.has(a); }
-  get hasMoveInput() { return Math.abs(this.moveX) + Math.abs(this.moveY) > 0.08; }
+  /** Clear all justPressed/justReleased edges. Call at the end of a frame. */
+  clearEdges(): void {
+    for (const a of ACTIONS) {
+      const b = this.intent.buttons[a];
+      b.justPressed = false;
+      b.justReleased = false;
+    }
+  }
+
+  setEnabled(on: boolean): void {
+    this.enabled = on;
+    if (!on) this.onBlur();
+  }
+
+  dispose(): void {
+    window.removeEventListener('keydown', this.onKeyDown as EventListener);
+    window.removeEventListener('keyup', this.onKeyUp as EventListener);
+    window.removeEventListener('blur', this.onBlur);
+    window.removeEventListener('gamepadconnected', this.onGamepadConnected as EventListener);
+    window.removeEventListener('gamepaddisconnected', this.onGamepadDisconnected as EventListener);
+  }
+}
+
+// ── Gamepad helpers ──────────────────────────────────────────────────────────
+function deadzone(v: number, dz: number): number {
+  const a = Math.abs(v);
+  if (a < dz) return 0;
+  return Math.sign(v) * ((a - dz) / (1 - dz));
+}
+
+/**
+ * Standard-mapping gamepad layout.
+ *
+ * The face buttons are laid out for a runner: jump under the thumb, dash on the
+ * shoulder where it can be held through a corner, attack next to jump. The
+ * triggers are the two levels — boost and slide — because a level wants a
+ * trigger and a verb wants a button.
+ */
+const PAD_MAP: Partial<Record<Action, number>> = {
+  jump: 0,          // A / cross
+  attack: 2,        // X / square
+  dive: 3,          // Y / triangle
+  dash: 5,          // RB
+  crouch: 6,        // LT
+  boost: 7,         // RT
+  lookBack: 10,
+  reset: 8,
+  pause: 9,
+  toggleCam: 11,
+};
+
+function padActionDown(pad: Gamepad, a: Action): boolean {
+  const idx = PAD_MAP[a];
+  if (idx === undefined) return false;
+  const b = pad.buttons[idx];
+  return !!b && b.pressed;
 }
