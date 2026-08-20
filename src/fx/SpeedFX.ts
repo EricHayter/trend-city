@@ -73,6 +73,7 @@ import {
 } from 'three';
 
 import { MoveMode, type PlayerState } from '../game/Contracts';
+import { RUN } from '../player/SparkConstants';
 import { YawRateTracker } from './PlayerSignals';
 import { clamp, clamp01, dampHL } from '../core/MathX';
 import { materialIdFor } from '../npr/CelMaterial';
@@ -130,14 +131,33 @@ export const SPEED_TUNING = {
    * straight and a switchback were indistinguishable without reading the
    * speedo. The effect has to live where the speed lives.
    */
-  // 6 / 19 rather than 8 / 24. These bracket the speed range the rays ramp
-  // across, and against a 74 m/s character the old pair saturated at 24 m/s —
-  // so the frame was a solid white wall from a third of top speed upward, for
-  // the whole rest of the run. The ceiling now sits just under `RUN.max` (20),
-  // which is what makes flat out look different from quick.
-  lineFloor: 6.0,
-  /** Full-strength reference speed, m/s. */
-  lineCeiling: 19.0,
+  // These bracket the speed range the rays ramp across. FRACTIONS, not metres
+  // per second: as absolute 22 and 70 they tracked a `RUN.max` of 74, and after
+  // the unit fix (`SPARK_UNIT_METRES`) top speed is 20.2 m/s, so the floor sat
+  // above the ceiling of what the character can do and the lines never appeared.
+  //
+  // THE CEILING IS `hardMax`, NOT A FRACTION OF `max`, and that correction is
+  // the whole point of this pair. It read `RUN.max * 0.95` — 19.2 m/s — on the
+  // argument that "keeping the ceiling BELOW the top speed is what makes flat
+  // out look different from merely quick". The argument inverts the facts: the
+  // character reaches `RUN.max` from a standing start in about 2.3 seconds and
+  // then HOLDS it, because `RUN.max` is the run target and the accel gears exist
+  // to get there. So a ceiling under it does not mark flat out, it saturates
+  // instantly and stays saturated, and the effect is pinned at `lineMax` for the
+  // entire descent. Captured at four points of the course with nothing held but
+  // forward — 20.2, 20.6, 19.9 and 20.1 m/s — the frame was full-strength rays
+  // in all four, opaque enough to read as blinds drawn over the mountain. That
+  // is the visual half of a player reporting the game is "way too fast".
+  //
+  // The band that actually VARIES is `RUN.max` to `RUN.hardMax`, 20.2 to 30.0,
+  // and it is exactly the band the game reserves for earning speed: a dash, a
+  // boost pad, a dash ring, a grind, a steep gully. Ramping across it means
+  // cruising sits at 0.47 of the effect and full strength means what the name
+  // says. The floor moves up to match — below about 11 m/s running is just
+  // running.
+  lineFloor: RUN.max * 0.55,
+  /** Full-strength reference speed, m/s. See `lineFloor` for why it is `hardMax`. */
+  lineCeiling: RUN.hardMax,
   /**
    * Exponent on the normalised speed.
    *
@@ -1323,11 +1343,10 @@ export class SpeedFX {
       // above almost every speed the course is actually ridden at, so the
       // geometry smear — the one that streaks a limb during a trick — was
       // effectively dead code outside a full-tuck sprint.
-      // Onset at 11 m/s, full by 17. These were 15 and 24 — authored for a
-      // character whose ceiling was 74, which after the rescale sits at and
-      // above the new top speed of 20, so the geometry smear would have been
-      // dead code for almost the entire speed range.
-      const fromSpeed = clamp01((state.speed - 11) / 6) * 0.68;
+      // Onset at 40 m/s, full by 66 — the top half of the speed range, so the
+      // geometry smear is the thing that says "this is fast even for this
+      // character" rather than a texture over the whole run.
+      const fromSpeed = clamp01((state.speed - 40) / 26) * 0.68;
       const fromSpin = whipping ? clamp01((spin - 4.2) / 6.5) * 0.9 : 0;
       const amount = Math.max(fromSpeed, fromSpin);
       if (amount > 0.02) {

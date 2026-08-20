@@ -45,7 +45,7 @@ import type {
   StageStats,
   TrackSampleResult,
 } from './Contracts';
-import { MoveMode, StagePhase, StageRank, TrackSectionKind, TraversalPrompt } from './Contracts';
+import { MoveMode, PickupKind, StagePhase, StageRank, TrackSectionKind, TraversalPrompt } from './Contracts';
 import { CHECKPOINT_TS, COUNTDOWN_SECONDS } from './WorldConstants';
 import { DAMAGE, RUN, SPARK_UNITS_PER_MPS } from '../player/SparkConstants';
 import { clamp01 } from '../core/MathX';
@@ -66,25 +66,46 @@ import { clamp01 } from '../core/MathX';
 const ROUTE_PROFILE_SAMPLES = 256;
 
 /**
- * The pace a competent run averages over the whole descent, m/s.
+ * The pace a competent run averages over the whole descent, ROUTE m/s.
  *
- * Not `RUN.max`. 20 m/s is the ceiling on a straight, and the course is not a
- * straight — the switchbacks, the rock garden and the technical start are all
- * places where the run is about carrying speed through a shape rather than
- * holding the ceiling. 13 m/s is 33 display units, about 65% of the ceiling, and
- * it is what a run that lands its wall-runs and holds its rails comes out at
- * once the slow sections are averaged back in.
+ * MEASURED, not derived, and the distinction matters: this is not a speed off
+ * the table and it must not be written as one. It is route distance over
+ * elapsed time, and route distance is arc length along the spline — so a player
+ * cutting inside a switchback advances it FASTER than their own ground speed.
+ * Par pace is therefore a function of the course's curvature as much as of the
+ * speed table, and no expression in terms of `RUN.max` would be honest.
  *
- * WAS 30, against the old 74 m/s ceiling. That produced a 27 s par and a 67 s
- * limit for a course a player crossed in 10.8 s, so the clock was never a
- * factor in anything. On an 800 m route this gives a 62 s par and a 154 s
- * limit against a ~40 s flat-out crossing — the fail-safe the block below
- * describes, rather than a formality.
+ * It was 30.0, which was unreachable in principle: `RUN.hardMax` is 29.98 m/s,
+ * so par demanded an average above the absolute speed ceiling. That came from
+ * the same unit error as everything else — the comment it replaces argued from
+ * "74 m/s is the ceiling" and set 30 as "a bit over 40% of" it. With the ceiling
+ * corrected (see `SPARK_UNIT_METRES`) 30 is 149% of top running speed, and par
+ * was a target no run could hit however well it was played.
+ *
+ * HOW THE 27 WAS MEASURED
+ *
+ * `tools/capture/_autorun.mjs` drives the stage with the forward input held for
+ * the entire descent, steering only on the route tangent and jumping only where
+ * the ribbon bridges more than 4 m of air. It uses no rail, no wall, no dash and
+ * no shortcut. That run clears the 2 km course in 78.5 s — a 25.5 m/s route
+ * pace — which is the floor par has to sit above, because a par a player reaches
+ * by holding one key is not a par.
+ *
+ * 27.0 puts par at 74.1 s, so the do-nothing run misses it by 4.4 s and the gap
+ * is what the traversal set is for: `DASH.speed` is 1.19x top speed, a dash ring
+ * leaves at 1.30x, and a rail carries speed through the switchbacks the autopilot
+ * scrubs off. The 6% margin is deliberately narrow and is the one number here
+ * that wants a human play-test — the autopilot can measure the floor but it
+ * cannot measure what a good player finds above it.
+ *
+ * RE-MEASURE THIS whenever the speed table, the layout planner or the course
+ * length changes. It is the only constant in this file that a code change can
+ * invalidate silently.
  *
  * Everything time-shaped in this file is expressed as a multiple of the par
  * time this produces, so the numbers survive the course changing length.
  */
-const PAR_PACE = 13.0;
+const PAR_PACE = 27.0;
 
 /**
  * The stage clock, as a multiple of par.
@@ -102,13 +123,22 @@ const TIME_LIMIT_PAR_MULTIPLE = 2.5;
 /**
  * Seconds left at which the clock starts alarming.
  *
- * 10. At `PAR_PACE` that is 300 m of course, which on an 800 m descent is the
- * last third — far enough out that the warning is information the player can
+ * 10. At `PAR_PACE` that is 270 m of course, which on the 2 km descent is the
+ * last seventh — far enough out that the warning is information the player can
  * still act on, close enough that it is not on screen for half the run. The
  * clock plate strobes at 5 Hz for the whole of it, so a longer window would be
  * a strobing panel in most captured frames.
  */
 const TIME_CRITICAL = 10.0;
+
+/**
+ * Seconds a time pickup hands back.
+ *
+ * 8 seconds, which at `PAR_PACE` is 216 m of course. Small enough that the
+ * route cannot be beaten on pickups alone, big enough that going out of the way
+ * for one is a real decision when the clock is inside `TIME_CRITICAL`.
+ */
+const TIME_PICKUP_SECONDS = 8.0;
 
 /**
  * How long `Cleared` and `Failed` hold before `Results`.
@@ -245,6 +275,15 @@ export class StageDirector implements IStageDirector {
   private _elapsed = 0;
   private readonly timeLimit: number;
   private readonly parTime: number;
+  /**
+   * Seconds handed back by time pickups.
+   *
+   * Added to the LIMIT rather than subtracted from the elapsed time, because the
+   * elapsed time is the run's result and a pickup must not make a finish look
+   * faster than it was. The clock the player is racing gets longer; the clock
+   * that goes on the leaderboard does not move.
+   */
+  private timeBonus = 0;
 
   // ── Progress ───────────────────────────────────────────────────────────────
   private _routeDistance = 0;
@@ -530,6 +569,7 @@ export class StageDirector implements IStageDirector {
    */
   resetRun(): void {
     this._elapsed = 0;
+    this.timeBonus = 0;
     this.verdictLeft = 0;
     this.runTopSpeed = 0;
     this.clearedRun = false;
@@ -554,6 +594,10 @@ export class StageDirector implements IStageDirector {
 
     this._stats.time = 0;
     this._stats.timeLeft = this.timeLimit;
+    this._stats.fragments = 0;
+    this._stats.shards = 0;
+    this.model.fragments = 0;
+    this.model.shards = 0;
     this._stats.damageTaken = 0;
     this._stats.bestCombo = 0;
     this._stats.styleScore = 0;
@@ -564,6 +608,62 @@ export class StageDirector implements IStageDirector {
     this._stats.isNewBest = false;
 
     this.syncClock();
+  }
+
+  // ── Collectibles ───────────────────────────────────────────────────────────
+
+  /**
+   * Declare how many of each collectible the course actually contains.
+   *
+   * Called once, after the layout is planned. The totals are not derivable here:
+   * the director knows the track but not what got scattered along it, and a HUD
+   * that reads `0 / 0` while the player collects things is the defect this
+   * exists to close.
+   */
+  setPickupTotals(fragments: number, shards: number): void {
+    this._stats.fragmentsTotal = fragments;
+    this._stats.shardsTotal = shards;
+    this.model.fragmentsTotal = fragments;
+    this.model.shardsTotal = shards;
+  }
+
+  /**
+   * Record one collected pickup.
+   *
+   * Only the kinds the STAGE owns are handled here. A cell heals and a charge
+   * fills the boost meter, and both of those live on the player — the run loop
+   * applies them there and does not route them through the director, because a
+   * director that could heal the player would be two systems owning one number.
+   *
+   * Counting is unconditional but the clock bonus is not: a time pickup taken
+   * outside a live run would extend a clock that is not running.
+   */
+  notePickup(kind: PickupKind): void {
+    const live = this._phase === StagePhase.Running || this._phase === StagePhase.Boss;
+
+    switch (kind) {
+      case PickupKind.Fragment:
+        this._stats.fragments++;
+        this.model.fragments = this._stats.fragments;
+        break;
+
+      case PickupKind.Shard:
+        this._stats.shards++;
+        this.model.shards = this._stats.shards;
+        this.pushPopup({ text: 'SHARD', value: this._stats.shards, kind: 'pickup' });
+        break;
+
+      case PickupKind.Time:
+        if (!live) break;
+        this.timeBonus += TIME_PICKUP_SECONDS;
+        this.syncClock();
+        this.pushPopup({ text: 'TIME', value: TIME_PICKUP_SECONDS, kind: 'pickup' });
+        break;
+
+      default:
+        // Cell and Charge are the player's business. See above.
+        break;
+    }
   }
 
   /**
@@ -800,7 +900,7 @@ export class StageDirector implements IStageDirector {
   private syncClock(): void {
     const s = this._stats;
     s.time = this._elapsed;
-    s.timeLeft = Math.max(0, this.timeLimit - this._elapsed);
+    s.timeLeft = Math.max(0, this.timeLimit + this.timeBonus - this._elapsed);
 
     this.model.time = s.time;
     this.model.timeLeft = s.timeLeft;

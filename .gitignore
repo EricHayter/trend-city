@@ -13,3 +13,6 @@ tools/capture/_out/
 
 # Claude Code local state and agent worktrees.
 .claude/
+
+# Vite dependency-optimiser cache
+.vite/

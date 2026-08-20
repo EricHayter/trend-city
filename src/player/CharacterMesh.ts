@@ -1724,11 +1724,11 @@ export function reHueMaterial(mat: CelMaterial, base: RampPreset, target: Color,
 const sharedMaterials = new Map<CharacterPart, CelMaterial>();
 
 /**
- * How hard each part is held to its identity once the rider gets small.
+ * How hard each part is held to its identity once the character gets small.
  *
  * `chroma` is how strongly the fragment is re-seated on the committed hue and
  * `rim` how strong the forced separating line is. The jersey carries almost
- * all of the recognition load — RIDER_COLORS is a jersey palette — so it is
+ * all of the recognition load — CHARACTER_COLORS is a jersey palette — so it is
  * held hardest; skin and rubber get a rim so the figure keeps its edges but
  * almost no chroma, because a skin tone pushed to full saturation at 20 px
  * reads as a costume rather than as an arm.

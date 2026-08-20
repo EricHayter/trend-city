@@ -46,26 +46,33 @@ export const METRES_PER_SAMPLE = WORLD_SIZE / HEIGHTMAP_SIZE;
  *     heights, ravine width. A 11.5 m gap needs the same speed to clear at any
  *     course length, and a 3 m trail is as wide as the bike needs it to be.
  *
- * 0.58 gives roughly 2.2 km and a two-and-a-half minute run.
+ * 1.0 is the authored course: 3807 m with 571 m of drop.
+ *
+ * It was 0.58 while the character ran at 20 m/s. `RUN.max` is Spark 3's real
+ * 74 m/s again (see the header of `SparkConstants.ts`), which crosses 2.2 km in
+ * 30 s, so the mountain is back at full size — the speed and the course are two
+ * ends of the same number and only one of them is allowed to be Spark's.
  */
-export const COURSE_SCALE = 0.58;
+export const COURSE_SCALE = 1.0;
 
 /**
  * How long the RACE is, in metres of track. The mountain is unaffected.
  *
- * A full descent of this course is a two-and-a-half minute run, and that is
- * still far too long to play on a keyboard or to show to anyone. This ends the
- * ribbon — and therefore the finish line, the checkpoints, the HUD profile and
- * the AI's planning horizon, all of which measure against `track.length` — at
- * 800 m, which is a little over a minute of riding.
+ * This ends the ribbon — and therefore the finish line, the checkpoints, the HUD
+ * profile and the AI's planning horizon, all of which measure against
+ * `track.length`. The spline the route fits is 2228 m long with 581 m of drop;
+ * this stops the race 228 m short of its bottom end. At `RUN.max` (74 m/s) a
+ * flat-out 2000 m is 27 s, and a real run that has to turn, land and
+ * re-accelerate comes out around 45 s. That is a stage, where the previous
+ * 800 m at a cut-down 20 m/s was 11 s of straight line.
  *
  * It is the TRACK that is truncated, never the route. The massif's descent
- * profile, the corridor prior and every terrain feature are built from the full
+ * profile, the corridor prior and every terrain feature are built from the whole
  * route, so the mountain still rises behind the start gate and still falls away
- * for two kilometres past the finish. Shortening the route instead would shrink
- * the world with it and leave the rider on a 30 m hillock.
+ * past the finish. Shortening the route instead would shrink the world with it
+ * and leave the character on a hillock.
  */
-export const RACE_LENGTH = 800;
+export const RACE_LENGTH = 2000;
 
 /** Vertical range of the mountain. */
 export const SEA_LEVEL = 0;
@@ -145,8 +152,9 @@ export const ROUTE: RouteControl[] = [
 
   // ── 3. Switchbacks: six bermed corners, tightening ───────────────────────
   //
-  // The FIRST SEVEN are inside the 800 m race (see RACE_LENGTH) and have been
-  // opened out; the rest are past the finish and left as authored.
+  // The first seven were opened out when they were the END of a truncated race
+  // and every excursion in the pack happened here; the rest are as authored.
+  // All of them are ridden now.
   //
   // As written they swung x from 30 to 87 and back to 23 across ninety metres
   // of z — a hairpin pair on a 27 m radius with the trail down to 5.6 m — and
@@ -301,10 +309,10 @@ export const TERRAIN_FEATURES: TerrainFeature[] = [
   // The tabletop. x/z is the TAKEOFF LIP and sits on the route; everything else
   // is measured along the route from there. See TABLETOP above.
   //
-  // Moved to 150 m along the course, and the finish flat to 240 m, because the
-  // RACE is now 240 m (see RACE_LENGTH). The ravine, ridge and stream anchors
-  // below are left where they are: they are two kilometres past the finish now,
-  // still shaping the mountain the rider is looking at, just not ridden.
+  // The race is the whole descent again (see RACE_LENGTH), so the ravine, the
+  // ridge and the stream below are RIDDEN rather than scenery — they sit at
+  // roughly 1150 m, 1500 m and 1800 m along the course. The tabletop stays where
+  // it is, 140 m in, as the first thing the character jumps.
   { kind: 'tabletop', x: -10.1, z: -806, params: { ...TABLETOP } },
   // The ravine: a genuine gap the rider must clear. Steep sides, 11m across.
   { kind: 'ravine', x: 18.6, z: 177.5, params: { width: 11.5, depth: 26, length: 139, angle: 1.44 } },
@@ -313,7 +321,10 @@ export const TERRAIN_FEATURES: TerrainFeature[] = [
   // The stream: a carved channel with a wet floor.
   { kind: 'stream-channel', x: 31.9, z: 545.2, params: { width: 14, depth: 5.5, length: 151, angle: 0.86 } },
   { kind: 'rock-garden', x: -29, z: -58, params: { radius: 41, roughness: 1.35, boulderCount: 46 } },
-  { kind: 'finish-flat', x: 4.4, z: -318.7, params: { radius: 35, flatness: 0.85 } },
+  // The finish sits at RACE_LENGTH along the spline, which is (26.3, 646.9) —
+  // measured, not guessed. Move RACE_LENGTH and this has to move with it or the
+  // finish line lands on a slope.
+  { kind: 'finish-flat', x: 26.3, z: 646.9, params: { radius: 35, flatness: 0.85 } },
 ];
 
 // ── The tabletop, as one shape both systems build ────────────────────────────

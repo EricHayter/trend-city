@@ -471,8 +471,34 @@ export class PlayerPhysics {
     }
 
     // ── Steering: rotate a heading, do not lerp a vector ───────────────────
+    //
+    // The heading is a STATE the player owns, seeded from `facing`, and NOT
+    // re-derived from the velocity direction. That distinction is the whole
+    // difference between a platformer and a vehicle, and getting it wrong is
+    // what made this build unplayable.
+    //
+    // The order of business below is: read the heading, steer it, REBUILD the
+    // velocity along it, then add the along-slope gravity term. So a
+    // velocity-derived heading reads back, one step later, a direction that the
+    // slope term has already rotated toward the fall line — which means the
+    // MOUNTAIN STEERS THE PLAYER. It gets worse, because `CameraDirector` takes
+    // its `travelYaw` from the velocity too and the move stick is resolved
+    // against the camera, so the heading, the camera and the input basis were
+    // all three defined relative to the same drifting vector with nothing
+    // anchoring any of them to the world. Measured with `_camloop.mjs`: holding
+    // nothing but forward on the switchbacks rotated the character continuously
+    // at about 65 deg/s, all the way round the compass and round again, and
+    // holding forward plus a touch of right settled into a perfect circle at
+    // 115 deg/s with the camera pinned 20.9 deg off the nose.
+    //
+    // Keeping it as a state does not throw the slope away — the term is still
+    // added to the velocity below and still pushes the character sideways
+    // across a face, and `h` still picks up its magnitude. It just no longer
+    // decides which way the character is POINTING. Anything that legitimately
+    // redirects the player — a booster, a dash ring, a wall mount, a rail exit
+    // — re-seats `facing` explicitly at its own call site.
     let h = Math.hypot(s.velocity.x, s.velocity.z);
-    let heading = h > 0.2 ? Math.atan2(s.velocity.x, s.velocity.z) : s.facing;
+    let heading = s.facing;
 
     const fast = clamp01(h / RUN.max);
     let turnRate = lerp(RUN.turnRateLow, RUN.turnRateHigh, fast);
@@ -535,7 +561,17 @@ export class PlayerPhysics {
     // The horizontal part of a heightfield normal points DOWNHILL, and the
     // horizontal component of gravity resolved into the surface plane is
     // exactly `g * n.y * (n.x, n.z)`. This one line is the mountain.
-    const slopeScale = (sliding ? SLIDE.slopeScale : 1) * SLOPE.accelScale;
+    //
+    // Tapered above `RUN.max`, because on a mountain this line is not merely the
+    // dominant term — unopposed it is the ONLY one. The gain is `18*sin(2*theta)`
+    // against `RUN.overDecay`'s constant 6.0, so every grade past 9.7 degrees
+    // runs speed to `hardMax` and holds it there; see `SLOPE.overTaper` for the
+    // autopilot trace that showed exactly that. Fading the gain across the
+    // 74-to-110 band gives each grade a terminal speed, which is what leaves the
+    // top of the band for the traversal set to reach into.
+    const over = h > RUN.max ? (h - RUN.max) / (RUN.hardMax - RUN.max) : 0;
+    const taper = over <= 0 ? 1 : Math.pow(Math.max(0, 1 - over), SLOPE.overTaper);
+    const slopeScale = (sliding ? SLIDE.slopeScale : 1) * SLOPE.accelScale * taper;
     const g = GRAVITY.accel * n.y * slopeScale * dt;
     s.velocity.x += n.x * g;
     s.velocity.z += n.z * g;
@@ -1124,10 +1160,30 @@ export class PlayerPhysics {
         s.position.y = h;
         s.groundNormal.copy(_v2);
         if (wasAirborne) this.land(sdt);
-        // Remove the into-surface velocity so the ground stick does not
-        // accumulate into a downward drift on a long traverse.
+        // Cancel the into-surface velocity on Y ONLY.
+        //
+        // The full normal projection this used to do is textbook collide-and-
+        // slide, and on a descent it is an energy PUMP. The grounded branch sets
+        // `velocity.y` from the horizontal speed so the character follows the
+        // surface; the substep integration then lands a few millimetres inside
+        // the next heightfield sample; projecting that out along the normal
+        // converts the vertical the branch just prescribed back into HORIZONTAL
+        // speed — which the next step's `velocity.y` is recomputed from, larger.
+        // Each substep closes the loop with a little more speed, and it runs
+        // AFTER the `RUN.hardMax` clamp, so nothing bounded it.
+        //
+        // An autopilot holding nothing but forward measured the result: ground
+        // speed hit 113 m/s two seconds past the start line — above `hardMax`
+        // itself — and stayed pinned there for the remaining 1990 m. The slope
+        // term was barely involved; tapering it changed the trace by nothing.
+        //
+        // The horizontal velocity is already exactly what the grounded branch
+        // decided, and `velocity.y` is already derived from it, so Y is the only
+        // axis the resolve has any correction to make. That also keeps the
+        // original intent — stopping `groundStick` from accumulating into a
+        // downward drift on a long traverse — which was always a Y concern.
         const into = s.velocity.dot(_v2);
-        if (into < 0) s.velocity.addScaledVector(_v2, -into);
+        if (into < 0) s.velocity.y -= into * _v2.y;
       } else {
         // Too steep to stand on. Slide along the face: cancel the horizontal
         // component driving into it, undo this substep's horizontal advance
@@ -1245,51 +1301,83 @@ export class PlayerPhysics {
       this.audio?.playDash(false);
     }
 
-    // ── Rails ─────────────────────────────────────────────────────────────
-    const canGrind =
-      s.mode !== MoveMode.Hurt && s.mode !== MoveMode.Homing &&
-      s.speed >= GRIND.minSpeed && this.railLock <= 0;
-    if (canGrind) {
-      const exclude = s.mode === MoveMode.Grinding ? s.railIndex : this.lastRailIndex;
-      const m = t.rails.findMount(from, to, s.velocity, exclude);
-      if (m && (s.mode !== MoveMode.Grinding || m.index !== s.railIndex)) {
-        this.mountRail(m.index, m.distance, m.sample);
-        return;
-      }
-    }
-
-    // ── Walls ─────────────────────────────────────────────────────────────
-    const canWall =
-      (s.mode === MoveMode.Airborne || s.mode === MoveMode.Dashing) &&
-      Math.hypot(s.velocity.x, s.velocity.z) >= WALL.mountSpeed;
-    if (canWall) {
-      const exclude = this.sameWallLock > 0 ? this.lastWallId : -1;
-      const w = t.walls.probe(from, to, s.velocity, exclude);
-      if (w && w.normal.y <= WALL.maxNormalY) {
-        s.wallNormal.copy(w.normal);
-        s.wallId = w.id;
-        s.wallTimeLeft = WALL.maxTime;
-        s.wallMountedThisStep = true;
-        this.wallHit = w;
-        // Sit just off the face so the resolve does not fight the stick.
-        s.position.copy(w.point).addScaledVector(w.normal, HULL.radius);
-        // Project the velocity into the wall plane and keep at least the mount
-        // speed, so arriving at a glancing angle still produces a real run.
-        const into = s.velocity.dot(w.normal);
-        s.velocity.addScaledVector(w.normal, -into);
-        const h = Math.hypot(s.velocity.x, s.velocity.z);
-        if (h < WALL.mountSpeed) {
-          const k = WALL.mountSpeed / Math.max(EPS, h);
-          s.velocity.x *= k;
-          s.velocity.z *= k;
-        }
-        s.facing = Math.atan2(s.velocity.x, s.velocity.z);
-        this.setMode(MoveMode.WallRun);
-        this.audio?.playWallMount();
-      }
+    // ── Rails and walls, in the order the character's motion is asking for ──
+    //
+    // Both are proximity mounts and their windows overlap on this course: a
+    // route rail sits at `halfWidth + 1.5` and a wall plate's face at
+    // `halfWidth + 1.3`, and `Layout` can only prefer to keep them apart, not
+    // guarantee it — see `WALL_RAIL_CLEARANCE` there for why rejecting every
+    // overlap deletes most of the walls.
+    //
+    // So the tie is broken here, by what the player is doing rather than by
+    // which probe happens to be written first. A rail is mountable from the
+    // GROUND: walk into it, grind. A wall is not — `canWall` demands airborne or
+    // dashing, and the only way to arrive is a jump or a dash INTO a face. Being
+    // in the air next to a plate is therefore a much stronger statement of
+    // intent than being next to a rail, so airborne asks the wall first.
+    //
+    // Measured with `tools/capture/_railprobe.mjs`: rails-first left plates 6,
+    // 8 and 11 unmountable, each one grinding instead for 46-59 of 60 steps.
+    const airborne = s.mode === MoveMode.Airborne || s.mode === MoveMode.Dashing;
+    if (airborne) {
+      if (this.tryMountWall(from, to)) return;
+      this.tryMountRail(from, to);
+    } else {
+      if (this.tryMountRail(from, to)) return;
+      this.tryMountWall(from, to);
     }
 
     void input;
+  }
+
+  /** Mount a rail if one is in reach. Returns whether the mode changed. */
+  private tryMountRail(from: Vector3, to: Vector3): boolean {
+    const s = this.state;
+    const t = this.traversal;
+    if (!t) return false;
+    if (s.mode === MoveMode.Hurt || s.mode === MoveMode.Homing) return false;
+    if (s.speed < GRIND.minSpeed || this.railLock > 0) return false;
+
+    const exclude = s.mode === MoveMode.Grinding ? s.railIndex : this.lastRailIndex;
+    const m = t.rails.findMount(from, to, s.velocity, exclude);
+    if (!m || (s.mode === MoveMode.Grinding && m.index === s.railIndex)) return false;
+    this.mountRail(m.index, m.distance, m.sample);
+    return true;
+  }
+
+  /** Mount a wall if a face is in reach. Returns whether the mode changed. */
+  private tryMountWall(from: Vector3, to: Vector3): boolean {
+    const s = this.state;
+    const t = this.traversal;
+    if (!t) return false;
+    if (s.mode !== MoveMode.Airborne && s.mode !== MoveMode.Dashing) return false;
+    if (Math.hypot(s.velocity.x, s.velocity.z) < WALL.mountSpeed) return false;
+
+    const exclude = this.sameWallLock > 0 ? this.lastWallId : -1;
+    const w = t.walls.probe(from, to, s.velocity, exclude);
+    if (!w || w.normal.y > WALL.maxNormalY) return false;
+
+    s.wallNormal.copy(w.normal);
+    s.wallId = w.id;
+    s.wallTimeLeft = WALL.maxTime;
+    s.wallMountedThisStep = true;
+    this.wallHit = w;
+    // Sit just off the face so the resolve does not fight the stick.
+    s.position.copy(w.point).addScaledVector(w.normal, HULL.radius);
+    // Project the velocity into the wall plane and keep at least the mount
+    // speed, so arriving at a glancing angle still produces a real run.
+    const into = s.velocity.dot(w.normal);
+    s.velocity.addScaledVector(w.normal, -into);
+    const h = Math.hypot(s.velocity.x, s.velocity.z);
+    if (h < WALL.mountSpeed) {
+      const k = WALL.mountSpeed / Math.max(EPS, h);
+      s.velocity.x *= k;
+      s.velocity.z *= k;
+    }
+    s.facing = Math.atan2(s.velocity.x, s.velocity.z);
+    this.setMode(MoveMode.WallRun);
+    this.audio?.playWallMount();
+    return true;
   }
 
   // ═════════════════════════════════════════════════════════════════════════

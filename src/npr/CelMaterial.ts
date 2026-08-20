@@ -75,10 +75,10 @@ export function materialIdFor(name: string): number {
 /**
  * Distance identity — the floors that keep a subject legible once it is small.
  *
- * The brief RIDER_COLORS states in Palette.ts is that four riders must be
- * "instantly distinguishable at 200 m in silhouette-plus-hue". Three separate
- * mechanisms conspire to break that, and all three get worse as the subject
- * shrinks rather than as it recedes:
+ * The brief CHARACTER_COLORS states in Palette.ts is that the character stay
+ * legible against grass, rock and snow at any size the course puts them at.
+ * Three separate mechanisms conspire to break that, and all three get worse as
+ * the subject shrinks rather than as it recedes:
  *
  *  1. THE INK EATS THE SHAPE. `LINES.targetPixels` holds the hull stroke at
  *     2.15 device px at every distance, and its only taper is by DISTANCE
@@ -102,7 +102,7 @@ export function materialIdFor(name: string): number {
  * Every constant here is a candidate for Palette.ts — see the report.
  */
 export interface IdentityOptions {
-  /** The committed identity hue. Comes from RIDER_COLORS. */
+  /** The committed identity hue. Comes from CHARACTER_COLORS. */
   color: Color;
   /** World metres the subject spans. A rider is ~1.7. */
   height?: number;

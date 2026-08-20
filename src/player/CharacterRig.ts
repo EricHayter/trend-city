@@ -67,7 +67,7 @@ import {
   type TwoBoneResult,
 } from './CharacterIK';
 import { applyCharacterColors, buildCharacterMeshes, type CharacterMeshSet } from './CharacterMesh';
-import { RIDER_COLORS } from '../npr/Palette';
+import { CHARACTER_COLORS } from '../npr/Palette';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Gait tuning
@@ -118,6 +118,13 @@ const ARM = {
   bendHalfLife: 0.035,
   minBend: 0.22,
 } as const;
+
+/**
+ * Straight-leg length, less a margin so the solver is never asked for a pose it
+ * can only reach by stretching. The stretch allowance exists for the frame a
+ * mode changes on, not for the whole run cycle.
+ */
+const LEG_REACH = (LIMB.thigh + LIMB.shin) * 0.97;
 
 const LEG = {
   len1: LIMB.thigh,
@@ -243,6 +250,13 @@ export class CharacterRig {
   };
 
   /** Gait cycle position, in cycles. One cycle is two steps. */
+  /**
+   * False until the first `update`, because the world plants can only be seeded
+   * once there is a world position to seed them from. The constructor runs
+   * before the player has been placed on the terrain.
+   */
+  private seeded = false;
+
   private gaitPhase = 0;
   /** Live cadence, cycles per second. */
   private cycleRate = 0;
@@ -261,8 +275,8 @@ export class CharacterRig {
   constructor(opts: CharacterRigOptions = {}) {
     this.skel = new CharacterSkeleton();
 
-    const primary = opts.primary ?? RIDER_COLORS[0].jersey.getHex();
-    const accent = opts.accent ?? RIDER_COLORS[0].accent.getHex();
+    const primary = opts.primary ?? CHARACTER_COLORS[0].jersey.getHex();
+    const accent = opts.accent ?? CHARACTER_COLORS[0].accent.getHex();
 
     this.meshes = buildCharacterMeshes(this.skel, {
       jersey: primary,
@@ -278,12 +292,11 @@ export class CharacterRig {
     group.add(this.meshes.group);
     this.object = group;
 
-    // Seed both feet planted under the hips so frame one is not a lunge.
+    // Seed the rig-space targets under the hips so frame one is not a lunge.
+    // The WORLD plants cannot be seeded here — there is no world position yet —
+    // so `seedFeet` does that on the first update.
     for (let i = 0; i < 2; i++) {
       const side = i === 0 ? 1 : -1;
-      this.feet[i].plant.set(side * STANCE.halfWidth, 0, STANCE.footAhead);
-      this.feet[i].liftFrom.copy(this.feet[i].plant);
-      this.feet[i].swingTo.copy(this.feet[i].plant);
       this.feet[i].target.set(side * STANCE.halfWidth, LIMB.ankleLift, STANCE.footAhead);
     }
   }
@@ -312,6 +325,10 @@ export class CharacterRig {
     if (dt <= 0) return;
 
     this.placeRigNode(state, dt);
+    if (!this.seeded) {
+      this.seedFeet();
+      this.seeded = true;
+    }
     this.driveChannels(state, dt);
     this.advanceGait(state, dt);
     this.resolveFeet(state, dt);
@@ -587,6 +604,16 @@ export class CharacterRig {
 
   private stride: number = GAIT.strideBase;
 
+  /** Rig-space Y of the hip sockets this frame. */
+  private hipY: number = REST.pos[BONE_INDEX.thighL].y;
+
+  /**
+   * How far from its hip socket, horizontally, a foot may be placed this frame
+   * without the leg having to stretch. Recomputed per frame because the hip
+   * height is a pose channel.
+   */
+  private reachXZ: number = LEG_REACH;
+
   /**
    * Resolve both feet to rig-space targets.
    *
@@ -596,42 +623,146 @@ export class CharacterRig {
    * normal, which is the only ground information the rig contract gives it — and
    * is exactly right for the slope the physics just resolved against.
    */
+  /**
+   * Pin both feet to the ground under the hips, in WORLD space.
+   *
+   * Deferred out of the constructor: `plant`, `liftFrom` and `swingTo` are world
+   * points, and there is no world position until the player has been placed on
+   * the terrain and `placeRigNode` has run once. Seeding them with rig-space
+   * values — which is what this used to do — leaves both feet pinned a kilometre
+   * from the character for the first stance phase.
+   */
+  private seedFeet(): void {
+    for (let i = 0; i < 2; i++) {
+      const side = i === 0 ? 1 : -1;
+      _v0.set(side * STANCE.halfWidth, 0, STANCE.footAhead);
+      this.toWorld(_v0, this.feet[i].plant);
+      this.feet[i].liftFrom.copy(this.feet[i].plant);
+      this.feet[i].swingTo.copy(this.feet[i].plant);
+      this.feet[i].planted = true;
+      this.feet[i].contact = 1;
+    }
+  }
+
+  /** Hip height and horizontal reach budget for this frame's pose. */
+  private updateReach(): void {
+    this.hipY = REST.pos[BONE_INDEX.thighL].y + this.pose.hipDrop;
+    const drop = this.hipY - LIMB.ankleLift;
+    const room = LEG_REACH * LEG_REACH - drop * drop;
+    this.reachXZ = room > 1e-4 ? Math.sqrt(room) : 0.02;
+  }
+
+  /**
+   * Pull a rig-space foot target inside the leg's reach, and report whether it
+   * had to move.
+   *
+   * This is not a safety net, it is the high-speed gait. The hips cover
+   * `speed * duty / cadence` metres in one stance phase — 2.5 m at 20 m/s — and
+   * a leg is 0.83 m long. Past a sprinter's cadence the foot CANNOT stay pinned
+   * to the ground, so it slips, and a deliberate slip reads as speed where an
+   * over-extended leg reads as a broken rig. Spark does the same thing.
+   */
+  private clampToReach(target: Vector3, sideSign: number): boolean {
+    // Rig +X is to the LEFT and `sideSign` is +1 for the left foot, so the hip
+    // socket's X is the rest thigh X signed by the side.
+    const hipX = sideSign * REST.pos[BONE_INDEX.thighL].x;
+    const dx = target.x - hipX;
+    const dz = target.z - REST.pos[BONE_INDEX.thighL].z;
+    const d2 = dx * dx + dz * dz;
+    const budget = this.reachXZ;
+    if (d2 <= budget * budget) return false;
+    const k = budget / Math.sqrt(d2);
+    target.x = hipX + dx * k;
+    target.z = REST.pos[BONE_INDEX.thighL].z + dz * k;
+    return true;
+  }
+
   private resolveFeet(state: PlayerState, dt: number): void {
+    this.updateReach();
     const holdBlend = clamp01(this.pose.legHold);
+
+    // Half the ground distance one sweep of a foot covers, bounded by reach.
+    const amp = Math.min(this.stride * GAIT.plantAhead, this.reachXZ * 0.82);
+
+    // How far the hips travel while one foot bears weight, versus how far that
+    // foot is able to sweep. Above about 6 m/s the hips out-run the leg and the
+    // foot CANNOT stay pinned to the ground, so the ground lock is faded out and
+    // the cycle below carries the motion on its own. Spark does the same: past a
+    // sprinter's cadence the feet slide, and sliding them on purpose reads as
+    // speed where an over-extended leg reads as a broken rig.
+    const stanceTravel = this.cycleRate > 1e-3
+      ? (state.groundSpeed * GAIT.duty) / this.cycleRate
+      : 0;
+    const pin = stanceTravel > 1e-4
+      ? smoothstep(0.55, 1, clamp01((amp * 2) / stanceTravel))
+      : 1;
+
+    // Sprinters run nearly on a single line, so the stance narrows with speed.
+    const narrow = STANCE.halfWidth * lerp(1, 0.35, clamp01(state.groundSpeed / RUN.max));
 
     for (let i = 0; i < 2; i++) {
       const foot = this.feet[i];
       const sideSign = i === 0 ? 1 : -1;
       const fp = frac(this.gaitPhase + (i === 0 ? 0 : 0.5));
       const inStance = fp < GAIT.duty;
+      const t = inStance
+        ? fp / GAIT.duty
+        : (fp - GAIT.duty) / (1 - GAIT.duty);
+      const lift = inStance
+        ? 0
+        : GAIT.swingLift * Math.sin(Math.PI * t) * (1 - this.pose.hyper * 0.55);
 
       if (holdBlend < 0.999) {
-        if (inStance) {
-          if (!foot.planted) {
-            // Touchdown. Pin the foot where the swing was heading.
-            foot.plant.copy(foot.swingTo);
-            foot.planted = true;
+        // ── The cycle, in rig space ──────────────────────────────────────────
+        // Stance drives the foot back at a constant rate; swing whips it forward
+        // on an eased curve with a sine arc for the lift. This is bounded by
+        // construction, so it is correct at 2 m/s and at 74.
+        _v0.set(
+          sideSign * narrow,
+          LIMB.ankleLift + lift,
+          inStance ? lerp(amp, -amp, t) : lerp(-amp, amp, smoothstep(0, 1, t)),
+        );
+
+        // ── Ground lock, blended in only while the leg can hold it ───────────
+        if (pin > 0.001) {
+          if (inStance) {
+            if (!foot.planted) {
+              // Touchdown. Pin the foot where the swing was heading.
+              foot.plant.copy(foot.swingTo);
+              foot.planted = true;
+            }
+            this.toRig(foot.plant, _v1);
+          } else {
+            if (foot.planted) {
+              // Lift-off. Record where we left and choose the next plant point.
+              foot.liftFrom.copy(foot.plant);
+              foot.planted = false;
+              this.chooseNextPlant(state, sideSign, foot.swingTo);
+            }
+            this.toRig(foot.liftFrom, _v2);
+            this.toRig(foot.swingTo, _v3);
+            _v1.lerpVectors(_v2, _v3, smoothstep(0, 1, t));
           }
-          foot.contact = 1;
-          this.toRig(foot.plant, _v0);
-          // Keep the pinned foot at ankle height above the contact plane.
-          _v0.y = Math.max(_v0.y, 0) + LIMB.ankleLift;
-        } else {
-          if (foot.planted) {
-            // Lift-off. Record where we left and choose the next plant point.
-            foot.liftFrom.copy(foot.plant);
-            foot.planted = false;
-            this.chooseNextPlant(state, sideSign, foot.swingTo);
-          }
-          const t = clamp01((fp - GAIT.duty) / (1 - GAIT.duty));
-          // Swing: lerp the ground track, add a sine arc for the lift.
-          this.toRig(foot.liftFrom, _v1);
-          this.toRig(foot.swingTo, _v2);
-          _v0.lerpVectors(_v1, _v2, smoothstep(0, 1, t));
-          const lift = GAIT.swingLift * Math.sin(Math.PI * t) * (1 - this.pose.hyper * 0.55);
-          _v0.y = Math.max(_v0.y, 0) + LIMB.ankleLift + lift;
-          foot.contact = 0;
+          // The contact plane is y = 0 in rig space by construction, so a foot
+          // on the ground sits at exactly ankle height on it. Honouring the
+          // pinned point's OWN height instead leaves the foot where the ground
+          // was at touchdown, which on a descent is most of a metre uphill of
+          // the character by mid-stance — a run whose legs trail out behind the
+          // hips in mid-air.
+          _v1.y = LIMB.ankleLift + lift;
+          this.clampToReach(_v1, sideSign);
+          _v0.lerp(_v1, pin);
+        } else if (inStance !== foot.planted) {
+          // Keep the pin bookkeeping in step even while it is faded out, so
+          // slowing back down does not start from a stale plant.
+          foot.planted = inStance;
+          this.toWorld(_v0, foot.plant);
+          foot.swingTo.copy(foot.plant);
+          foot.liftFrom.copy(foot.plant);
         }
+
+        if (inStance) this.toWorld(_v0, foot.plant);
+        foot.contact = inStance ? 1 : 0;
       } else {
         _v0.set(sideSign * STANCE.halfWidth, LIMB.ankleLift, STANCE.footAhead);
         foot.contact = 0;
@@ -671,7 +802,9 @@ export class CharacterRig {
    * waddle), and projected onto the contact plane.
    */
   private chooseNextPlant(state: PlayerState, sideSign: number, out: Vector3): void {
-    const ahead = this.stride * GAIT.plantAhead;
+    // Never aim further ahead than the leg can reach, or touchdown begins with
+    // the knee locked and the foot skating to catch up.
+    const ahead = Math.min(this.stride * GAIT.plantAhead, this.reachXZ * 0.82);
     // Narrow the stance as speed rises; sprinters run nearly on a single line.
     const half = STANCE.halfWidth * lerp(1, 0.35, clamp01(state.groundSpeed / RUN.max));
 

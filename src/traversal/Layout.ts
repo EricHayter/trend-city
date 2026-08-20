@@ -32,7 +32,7 @@ import {
   TrackSectionKind,
 } from '../game/Contracts';
 import type { ITerrain, ITrack, TrackSampleResult } from '../game/Contracts';
-import { GRIND, HULL, RUN, WALL } from '../player/SparkConstants';
+import { GRAVITY, GRIND, HULL, JUMP, RUN, WALL } from '../player/SparkConstants';
 import { Rng } from '../core/RNG';
 import { clamp, lerp } from '../core/MathX';
 import { smoothCage } from './Path';
@@ -133,6 +133,102 @@ const ENTRY_HEIGHT = 1.15;
 const BODY_HEIGHT = 2.55;
 /** Metres of rail spent ramping between the two. */
 const RAMP_LENGTH = 16;
+
+/**
+ * Lateral-rise score above which a wall plate is backed by real terrain and can
+ * afford to be taller. Calibrated against the measured profile in
+ * `lateralRise`'s comment — 12 catches the two genuinely steep flanks on the
+ * current course and leaves the rest as plain 8.5 m plates.
+ */
+const WALL_NATURAL_SCORE = 12;
+
+/**
+ * Metres of runnable band a plate must offer at its UPHILL end.
+ *
+ * `WallSet` gives a plate one `baseY` and one `topY` for the whole panel, and
+ * gates a mount on the character being inside `[baseY + 0.6, topY - 0.3]`. That
+ * is a horizontal band, but a plate on this mountain spans a DESCENT — so the
+ * ground the player stands on rises across the plate while the band does not,
+ * and the band's usable part is `height - drop - 0.9`, not `height`.
+ *
+ * That was the bug. `pushWall` took `baseY` from the MINIMUM ground under the
+ * plate, which on a descent is its downhill end, and left `height` at the 8.5
+ * the scorer asked for. A 34-68 m plate at this course's 27% average drops 9-18
+ * m, so the usable band was negative for a third of the plates and under 3 m for
+ * most of the rest. Measured with `tools/capture/_wallsite.mjs`: 3 of 12 plates
+ * had no runnable band at all, one of them buried 11.5 m into its own 8.5 m
+ * height, and a physics probe placed on the face mounted 2 of 12.
+ *
+ * 6 m is the target, which is about three of the character's own height and
+ * enough that arriving on a jump arc does not need to be precise.
+ */
+const WALL_MIN_BAND = 6.0;
+
+/**
+ * Metres of drop a single plate may span before it is truncated.
+ *
+ * Covering the drop with height is the fix, but it cannot be the whole fix: at
+ * 27% a 68 m plate drops 18 m, and covering that means a 25 m slab, which is not
+ * an outcrop any more. Truncating the plate where the drop reaches this instead
+ * keeps both the height and the length in the range the geometry was designed
+ * for — a plate ends up roughly this over `this / grade` metres of route, so 9 m
+ * gives a 33 m plate on the average pitch and a shorter one on the steep ones,
+ * which is the right way round.
+ */
+const WALL_MAX_DROP = 9.0;
+
+/**
+ * Metres of lateral separation a plate needs from any rail on its own side.
+ *
+ * `probeTraversal` tries boosters, then RAILS, then walls, and returns on the
+ * first mount. So a rail inside a plate's approach does not compete with the
+ * wall run — it pre-empts it, every time, and the plate becomes scenery.
+ *
+ * That is what was happening. A route rail sits at `halfWidth + 1.5` and a
+ * plate's nodes at `halfWidth + 1.3`: twenty centimetres apart. Rails go down
+ * every 110 m alternating sides and run 80-190 m, plates every 230 m on
+ * whichever side the terrain rears up, so the two schedules beat against each
+ * other and land on the same side often. Measured with
+ * `tools/capture/_railprobe.mjs`: plates 6 and 11 mounted `rail13` and `rail24`
+ * instead of running, and plate 8 was grinding for 46 of 60 steps.
+ *
+ * The clearance needed is the rail's capture radius plus the plate's own
+ * contact reach, because a mount is decided on the character's hull and not on
+ * either centreline. Anything closer than that and the rail's window strictly
+ * contains the wall's.
+ *
+ * This is a PREFERENCE, not a constraint — see the comment at the swap in
+ * `planWalls`. The overlap that survives it is resolved in
+ * `PlayerPhysics.probeTraversal`, which asks the wall first while the character
+ * is airborne, on the grounds that a rail can be mounted from the ground and a
+ * wall cannot.
+ */
+const WALL_RAIL_CLEARANCE = GRIND.snapRadius + HULL.radius + 0.34;
+
+/**
+ * Metres a plate stands proud of the trail edge.
+ *
+ * Read by `pushWall`, which builds the nodes, and by `planWalls`, which has to
+ * know where the face will land to test it against the rails. Those two used to
+ * state 1.3 separately, which is the failure this file has already been bitten
+ * by twice: a constant that is restated rather than read goes stale silently.
+ */
+const WALL_TRAIL_OFFSET = 1.3;
+
+/** Route metres between chimney search windows. Two on a 2 km course. */
+const CHIMNEY_STRIDE = 620;
+/** Length of a chimney's plates, metres. Four to six wall jumps of climb. */
+const CHIMNEY_LENGTH = 56;
+/** Chimney plate height. Tall enough that the climb is the point. */
+const CHIMNEY_HEIGHT = 15.5;
+/**
+ * Widest trail half-width that still makes a crossable chimney.
+ *
+ * The corridor is about `2 * (halfWidth + WALL_STANDOFF)`, so 6 gives a 14.6 m
+ * gap. Wider than that and a wall jump does not carry the character to the
+ * facing plate, which turns the feature into two unrelated wall runs.
+ */
+const CHIMNEY_MAX_HALF_WIDTH = 6;
 
 class Planner {
   private a = makeSample();
@@ -584,42 +680,196 @@ function planHelixes(p: Planner, out: Layout): void {
  * a mechanic that is only sometimes available is a mechanic players stop
  * looking for.
  */
+/**
+ * Score the terrain's lateral rise beside the trail over the next 60 m.
+ *
+ * A positive score means the ground climbs away from the trail on that side, so
+ * a plate put there reads as an outcrop rather than a fence in a field.
+ *
+ * The threshold this is compared against is MEASURED, not guessed. The trail is
+ * carved into the mountain and the carve blends over a wide margin, so at
+ * `halfWidth + 1.5` the ground is still nearly trail-level; sampled every 230 m
+ * down the current 2 km course, the best score on either side is:
+ *
+ *     d      70   300   530   760   990  1220  1450  1680  1910
+ *     left  3.9     0     0     0   3.4     0     0     0     0
+ *     right 3.5  19.6   3.3     0     0   3.4   6.7     0     0
+ *
+ * The old test asked for 45. Nothing on the mountain reaches half that, so
+ * EVERY wall came out as the 8.5 m fallback and `natural` was dead code — which
+ * also killed the chimneys, because they were gated behind it.
+ */
+function lateralRise(p: Planner, d0: number, side: number, probe: Vector3): number {
+  let score = 0;
+  for (let u = 0; u < 60; u += 6) {
+    const s = p.sample(d0 + u, 1);
+    probe.copy(s.position).addScaledVector(s.left, side * (s.halfWidth + 1.5));
+    const h0 = p.groundAt(probe);
+    probe.addScaledVector(s.left, side * 6);
+    const h1 = p.groundAt(probe);
+    const rise = h1 - h0;
+    if (rise > 2.4) score += rise;
+  }
+  return score;
+}
+
+/**
+ * Signed lateral offset of a rail from the trail centreline, in metres.
+ *
+ * Positive is `left`, matching the `side` a plate is placed on. Taken at the
+ * rail's midpoint, which is enough: a rail is built at a constant lateral
+ * offset along its whole length, and the ones that are not (helixes, spans)
+ * wander far enough that a midpoint sample still answers the only question
+ * being asked — is this thing in the plate's way.
+ *
+ * Derived from the cage rather than recorded at build time on purpose. A rail
+ * kind added later gets this for free, and cannot forget to declare a side.
+ */
+function railLateral(p: Planner, rail: { routeDistance: number; exitRouteDistance: number; cage: Vector3[] }): number {
+  const mid = rail.cage[Math.floor(rail.cage.length / 2)];
+  const s = p.sample((rail.routeDistance + rail.exitRouteDistance) * 0.5, 1);
+  return (mid.x - s.position.x) * s.left.x + (mid.z - s.position.z) * s.left.z;
+}
+
 function planWalls(p: Planner, out: Layout, density: number): void {
   const L = p.L;
   const stride = 230 / Math.max(0.15, density);
   const probe = new Vector3();
+
+  // Every rail already placed, as (from, to, lateral). Rails are planned before
+  // walls, so this is the complete set — and it has to be the complete set
+  // rather than just the route rails, because a shortcut or a helix pre-empts a
+  // wall run exactly as hard. See `WALL_RAIL_CLEARANCE`.
+  const railBands = out.rails.map((r) => ({
+    from: r.routeDistance,
+    to: r.exitRouteDistance,
+    lateral: railLateral(p, r),
+  }));
+
+  /** Is a rail close enough to this plate's face to pre-empt every mount on it? */
+  const railInTheWay = (d0: number, d1: number, side: number, lateral: number): boolean =>
+    railBands.some(
+      (b) =>
+        b.to > d0 &&
+        b.from < d1 &&
+        Math.sign(b.lateral) === side &&
+        Math.abs(Math.abs(b.lateral) - lateral) < WALL_RAIL_CLEARANCE,
+    );
+
+  // Chimneys first, so the plain plates can be told where not to go. A plain
+  // plate overlapping a chimney's span would sit inside one of its faces:
+  // z-fighting to look at, and two candidate mounts a metre apart for
+  // `WallSet.probe` to pick between at 74 m/s.
+  const claimed = planChimneys(p, out, density);
 
   for (let d0 = 70; d0 < L - 60; d0 += stride) {
     // Score both sides over the next 60 m and take the steeper.
     let bestSide = 0;
     let bestScore = 0;
     for (const side of [-1, 1]) {
-      let score = 0;
-      for (let u = 0; u < 60; u += 6) {
-        const s = p.sample(d0 + u, 1);
-        probe.copy(s.position).addScaledVector(s.left, side * (s.halfWidth + 1.5));
-        const h0 = p.groundAt(probe);
-        probe.addScaledVector(s.left, side * 6);
-        const h1 = p.groundAt(probe);
-        const rise = h1 - h0;
-        if (rise > 3.2) score += rise;
-      }
+      const score = lateralRise(p, d0, side, probe);
       if (score > bestScore) { bestScore = score; bestSide = side; }
     }
-    const side = bestSide !== 0 ? bestSide : (p.next() < 0.5 ? 1 : -1);
-    const natural = bestScore > 45;
+    let side = bestSide !== 0 ? bestSide : (p.next() < 0.5 ? 1 : -1);
+    const natural = bestScore > WALL_NATURAL_SCORE;
 
-    // A chimney needs two facing plates and a corridor the character can bank
-    // across. Only built where the trail is narrow enough to cross at speed.
-    const s0 = p.sample(d0, 0);
-    const chimney = natural && s0.halfWidth < 7 && p.next() < 0.45;
+    let len = clamp(p.range(34, 68), 30, L - d0 - 20);
 
-    const len = clamp(p.range(34, 68), 30, L - d0 - 20);
-    const height = chimney ? 13.5 : natural ? clamp(6 + bestScore * 0.08, 7, 12) : 8.5;
+    // Shorten, then drop, rather than shifting: moving the plate downhill would
+    // put it wherever the next chimney is not, which is how a fence ends up in
+    // the middle of a straight.
+    let skip = false;
+    for (const [c0, c1] of claimed) {
+      if (d0 + len <= c0 - 8 || d0 >= c1 + 8) continue;
+      if (d0 + 30 <= c0 - 8) len = c0 - 8 - d0;
+      else { skip = true; break; }
+    }
+    if (skip) continue;
 
-    pushWall(p, out, d0, len, side, height, chimney);
-    if (chimney) pushWall(p, out, d0, len, -side, height, true);
+    // A plate on a side a rail already owns is worth AVOIDING but never worth
+    // skipping a site for. Rails go down every 110 m alternating sides and run
+    // 80-190 m, so on this course both sides of a 30-68 m plate span are usually
+    // covered somewhere: rejecting overlaps outright took the wall count from 12
+    // to 4 and deleted both chimneys, which is a worse game than an overlap. So
+    // the preference is soft — swap sides if that clears the rail, otherwise
+    // build anyway and let `PlayerPhysics.probeTraversal` resolve it. See
+    // `WALL_RAIL_CLEARANCE` for why the overlap matters at all.
+    //
+    // Lateral offset the face will end up at, measured from the centreline the
+    // rails are measured from. `halfWidth` varies down the course, so it has to
+    // be sampled at the site rather than assumed.
+    const lateral = p.sample(d0 + len * 0.5, 1).halfWidth + WALL_TRAIL_OFFSET;
+    if (railInTheWay(d0, d0 + len, side, lateral) && !railInTheWay(d0, d0 + len, -side, lateral)) {
+      side = -side;
+    }
+
+    const height = natural ? clamp(7 + bestScore * 0.28, 8, 13) : 8.5;
+
+    pushWall(p, out, d0, len, side, height, false);
   }
+}
+
+/**
+ * The wall-jump chimneys.
+ *
+ * BUILT, NOT FOUND. Chimneys used to be a side effect of the terrain search
+ * above: a plate got a facing twin only where the mountain happened to be steep
+ * on one side AND the trail happened to be narrow AND a coin flip came up. On
+ * this course that conjunction never occurred, so `PlayerPhysics.tryWallJump` —
+ * which is written, tested and explicitly commented for "chaining wall jumps up
+ * a chimney" — had no geometry anywhere on the mountain to chain up.
+ *
+ * A chimney is a designed feature in the same sense a rail or a kicker is. The
+ * plates already stand `WALL_STANDOFF` off the ground and carry their own base
+ * height, so nothing about them requires the terrain to have dug the corridor
+ * first. What the terrain does decide is WHERE: the trail's own width is the
+ * constraint, because the corridor between two facing plates is about
+ * `2 * (halfWidth + WALL_STANDOFF)` wide, and a chimney the character cannot
+ * cross in one bank is not a chimney, it is two separate walls.
+ *
+ * So: scan each window for its narrowest point rather than sampling one distance
+ * and hoping. On the current course that finds the 1575-1800 gorge (halfWidth
+ * 3.2, a 9 m corridor) and the 900-1125 narrows (halfWidth 5.1, a 13 m
+ * corridor), which are the two places a player would look at and expect to be
+ * able to go up.
+ */
+function planChimneys(p: Planner, out: Layout, density: number): Array<[number, number]> {
+  const claimed: Array<[number, number]> = [];
+  const L = p.L;
+  const stride = CHIMNEY_STRIDE / Math.max(0.15, density);
+  // Start past the first stretch: a chimney in the opening 200 m is reached
+  // before the player has the speed to mount a wall at all.
+  const first = 260;
+
+  for (let w0 = first; w0 + CHIMNEY_LENGTH + 40 < L; w0 += stride) {
+    const w1 = Math.min(L - CHIMNEY_LENGTH - 40, w0 + stride - CHIMNEY_LENGTH);
+    if (w1 <= w0) continue;
+
+    // Narrowest point in the window. Sampled at 15 m, which is finer than the
+    // 25 m at which the width profile has any structure.
+    let bestD = w0;
+    let bestHalf = Infinity;
+    for (let d = w0; d <= w1; d += 15) {
+      const hw = p.sample(d, 0).halfWidth;
+      if (hw < bestHalf) { bestHalf = hw; bestD = d; }
+    }
+
+    // Too wide to bank across is not a chimney. Skipped out loud rather than
+    // built badly — a window with no narrow point simply has no chimney.
+    if (bestHalf > CHIMNEY_MAX_HALF_WIDTH) continue;
+
+    // Nudge off the exact minimum so the plates start just BEFORE the pinch and
+    // the corridor closes as the player travels down it, which is the shape that
+    // reads as an entrance.
+    const d0 = Math.max(w0, bestD - CHIMNEY_LENGTH * 0.35);
+    const height = CHIMNEY_HEIGHT;
+
+    pushWall(p, out, d0, CHIMNEY_LENGTH, 1, height, true);
+    pushWall(p, out, d0, CHIMNEY_LENGTH, -1, height, true);
+    claimed.push([d0, d0 + CHIMNEY_LENGTH]);
+  }
+
+  return claimed;
 }
 
 function pushWall(
@@ -635,15 +885,21 @@ function pushWall(
   const normals: Vector3[] = [];
   const step = 6;
   let baseY = Infinity;
+  let topG = -Infinity;
 
   for (let u = 0; u <= len; u += step) {
     const s = p.sample(d0 + u, 1);
     const q = new Vector3()
       .copy(s.position)
-      .addScaledVector(s.left, side * (s.halfWidth + 1.3));
+      .addScaledVector(s.left, side * (s.halfWidth + WALL_TRAIL_OFFSET));
     const g = p.terrainHeightAt(q.x, q.z);
     q.y = Math.min(g, s.position.y);
+    // Stop where the plate has spanned as much drop as one flat band can carry.
+    // Checked BEFORE the node is kept, and only once there are enough nodes to
+    // be a plate, so a steep pitch yields a short plate rather than a slab.
+    if (nodes.length >= 3 && Math.max(topG, q.y) - Math.min(baseY, q.y) > WALL_MAX_DROP) break;
     if (q.y < baseY) baseY = q.y;
+    if (q.y > topG) topG = q.y;
     nodes.push(q);
     // The runnable face looks back at the trail, so the outward normal is the
     // direction the player comes from: -side * left.
@@ -652,10 +908,16 @@ function pushWall(
   if (nodes.length < 3) return;
 
   // One base height for the whole plate. A plate that follows the ground has a
-  // base edge that steps, and the run height then steps with it.
+  // base edge that steps, and the run height then steps with it — and `WallSet`
+  // could not use it anyway, since a panel carries a single base and top.
   for (const n of nodes) n.y = baseY - 0.6;
 
-  out.walls.push({ routeDistance: d0, nodes, normals, height, chimney });
+  // The band is flat and the ground under it is not, so the height has to pay
+  // for the drop before any of it is runnable. See `WALL_MIN_BAND`.
+  const drop = Math.max(0, topG - baseY);
+  const runnable = Math.max(height, drop + WALL_MIN_BAND + 0.9);
+
+  out.walls.push({ routeDistance: d0, nodes, normals, height: runnable, chimney });
 }
 
 // ── Boosters ─────────────────────────────────────────────────────────────────
@@ -683,7 +945,12 @@ function planBoosters(p: Planner, out: Layout, density: number): void {
       up: s.up.clone(),
       routeDistance: straightest,
       radius: 3.4,
-      power: 24,
+      // Additive speed, as a FRACTION of top speed rather than an absolute.
+      // These powers were authored as bare m/s when `RUN.max` was 74, so when the
+      // unit error behind that number was corrected (`SPARK_UNIT_METRES`) a pad
+      // that had been worth a third of top speed became worth 1.2x of it. The
+      // ratio is the design; the metres per second are a consequence of it.
+      power: RUN.max * 0.324,
     });
   }
 
@@ -702,7 +969,11 @@ function planBoosters(p: Planner, out: Layout, density: number): void {
       up: s.up.clone(),
       routeDistance: d,
       radius: 2.9,
-      power: 34,
+      // Vertical launch velocity, so the natural reference is a JUMP and not top
+      // speed: 2.06 jumps' worth of rise is what this was when it was the bare
+      // 34, and a spring that throws you about twice as high as your own jump is
+      // the reason to aim for one.
+      power: JUMP.velocity * 2.06,
     });
   }
 
@@ -733,7 +1004,11 @@ function planBoosters(p: Planner, out: Layout, density: number): void {
       const v = RUN.max;
       const vy = v * Math.sin(rampAngle);
       const tflight = (d - lip) / Math.max(1, v * Math.cos(rampAngle));
-      const y = vy * tflight - 0.5 * 36 * tflight * tflight;
+      // `GRAVITY.accel`, not a literal 36. The literal was Spark's gravity in
+      // SPARK units, and this solve is in world metres — so it placed the rings
+      // on the arc of a launch under 3.7 Earth gravities and buried them in the
+      // ravine wall.
+      const y = vy * tflight - 0.5 * GRAVITY.accel * tflight * tflight;
       out.boosters.push({
         kind: BoosterKind.DashRing,
         position: p.point(d, 0, Math.max(3.2, y)),
@@ -741,7 +1016,11 @@ function planBoosters(p: Planner, out: Layout, density: number): void {
         up: sr.up.clone(),
         routeDistance: d,
         radius: 3.4,
-        power: 92,
+        // ABSOLUTE — a dash ring replaces the velocity outright, so this number
+        // is the speed the player leaves at and it has to be read against the
+        // speed table. 1.24x top speed is a shade over a dash (`DASH.speed` is
+        // 1.19x), which is what makes flying the ring better than dashing the gap.
+        power: RUN.max * 1.243,
       });
     }
   }
@@ -759,7 +1038,9 @@ function planBoosters(p: Planner, out: Layout, density: number): void {
       up: s.up.clone(),
       routeDistance: d + 12,
       radius: 3.6,
-      power: 96,
+      // The reward ring at a shortcut exit, so it pays slightly better than the
+      // ones strung across a gap: 1.30x top speed against their 1.24x.
+      power: RUN.max * 1.297,
     });
   }
 }

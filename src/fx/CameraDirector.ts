@@ -162,6 +162,7 @@ import {
   springStepDamped,
   type SpringState,
 } from '../core/MathX';
+import { RUN } from '../player/SparkConstants';
 import { Noise2D } from '../core/Noise';
 import { Rng } from '../core/RNG';
 import { BIKE } from '../game/WorldConstants';
@@ -241,15 +242,18 @@ export const CAMERA_TUNING = {
   /** Retained for source compatibility. Nothing reads it. */
   fovExponent: 2.7,
   /** Speed treated as "flat out", m/s. */
-  // 20, not 26. Every speed-shaped term in this file is `speed /
-  // referenceSpeed` clamped to 1 — the FOV curve, the dolly standoff and the
-  // lens buffet — so this value IS the top of the camera's dynamic range. At 26
-  // against a 74 m/s character all three clamped at 1.0 from 26 m/s upward:
-  // maximum lens, maximum standoff and maximum buffet held flat out for 65% of
-  // the speed range, with nothing left to express. A camera pinned at full
-  // amplitude reads as broken rather than as fast. Set to `RUN.max` so the top
-  // of the camera's range is the top of the character's.
-  referenceSpeed: 20,
+  // Every speed-shaped term in this file is `speed / referenceSpeed` clamped to
+  // 1 — the FOV curve, the dolly standoff and the lens buffet — so this value IS
+  // the top of the camera's dynamic range, and it has to BE `RUN.max` or the
+  // camera runs out of things to say before the character runs out of speed.
+  //
+  // READ IT, do not restate it. This was the literal `74` while `RUN.max` was
+  // the same literal, and when the unit error behind that number was fixed (see
+  // `SPARK_UNIT_METRES`) the camera kept normalising against a speed 3.7x the
+  // one the character could reach: every speed-shaped term sat near zero for the
+  // whole run, so the lens never opened, the dolly never pulled back and the
+  // buffet never fired. A copied constant is a constant that can be wrong alone.
+  referenceSpeed: RUN.max,
 
   /**
    * THE FRAMING CONSTANT. Standoff × tan(halfFov), metres.
@@ -346,6 +350,20 @@ export const CAMERA_TUNING = {
    * difference between a camera that follows and a camera that leads.
    */
   cornerLookArc: 0.75,
+  /**
+   * Half-life, seconds, of the INPUT BASIS following the character's facing.
+   *
+   * Not a cinematic knob. This is the one number that decides whether holding a
+   * direction on the stick goes somewhere, because the move stick is resolved
+   * against `yaw` and `yaw` is this. Long enough that a short input is
+   * effectively world-referenced — press right, go right, in a straight line —
+   * and short enough that the basis is still behind the character by the time a
+   * switchback is over.
+   *
+   * It must not carry ANY term proportional to the character's turn rate. See
+   * `inputYaw`.
+   */
+  inputYawHalfLife: 0.55,
 
   // ── Speed as an event ──────────────────────────────────────────────────────
   /**
@@ -971,6 +989,11 @@ export class CameraDirector implements ICameraDirector {
    * `PlayerInput.cameraYaw` can be fed this value directly.
    */
   get yaw(): number {
+    return this.inputYaw;
+  }
+
+  /** Where the finished lens points. Not the input basis — see `inputYaw`. */
+  get lensYaw(): number {
     return this.viewYaw;
   }
 
@@ -1008,14 +1031,51 @@ export class CameraDirector implements ICameraDirector {
   /**
    * The lens's own heading, atan2(x, z), refreshed at the end of every compose.
    *
-   * This is the contract's `yaw`, and the player's move stick is resolved
-   * against it — so it has to be the direction the PLAYER IS LOOKING, measured
-   * off the finished camera after the shake and the buffet, not the boom's
-   * `aimYaw`. Those differ by up to the corner-lead arc, and a stick resolved
-   * against the arm rather than the lens sends the character off at an angle to
-   * the pressed direction on every corner.
+   * The direction the finished lens is actually pointing, after the corner-lead
+   * arc, the lateral swing, the roll and the buffet. Read by anything that needs
+   * to know where the camera looks.
+   *
+   * THIS IS NO LONGER THE CONTRACT'S `yaw`, and the reason is the whole reason
+   * this build was unplayable. The move stick is resolved against `yaw`, and
+   * this value contains `bend`, which is `yawRate * leadT * cornerLookArc` — a
+   * term PROPORTIONAL TO HOW FAST THE CHARACTER IS TURNING. Resolving the stick
+   * against it closes a positive-feedback loop with no fixed point: the
+   * character turns, the lens leads further into the turn, "forward" rotates
+   * with it, the character turns further.
+   *
+   * Measured with `_camloop.mjs` before the split. Holding forward plus a touch
+   * of right, the lens pinned at a constant 20.9 deg off the nose and the
+   * character rotated forever at 115 deg/s — a closed circular orbit, because a
+   * constant lead against a camera-relative stick is a rotation with no
+   * equilibrium. Hard right pinned 88 deg of lead and spun at 220 deg/s. The
+   * implied loop gain, 0.365 rad of lead per 2.0 rad/s of turn, is 0.18 s, which
+   * is `leadT * cornerLookArc` to the measurement's precision.
+   *
+   * The cinematics stay. They are applied to what the camera SHOWS. The basis the
+   * player's hand is resolved against is `inputYaw`, which is a different thing
+   * and has to be.
    */
   private viewYaw = 0;
+
+  /**
+   * The basis the move stick is resolved against — the contract's `yaw`.
+   *
+   * A plain damped follow of the subject's FACING. Three properties, all
+   * load-bearing, and each one is a bug that was in here:
+   *
+   *   - It follows `facing`, not the velocity direction. `travelYaw` is taken
+   *     from the velocity, and on a traverse the along-slope gravity term
+   *     rotates the velocity toward the fall line every step, so a
+   *     velocity-derived basis is dragged downhill and drags the player's idea
+   *     of "forward" with it. See the steering comment in
+   *     `PlayerPhysics.stepGrounded`.
+   *   - It contains no lead, no swing, no roll and no buffet — nothing
+   *     proportional to the turn rate. See `viewYaw` for what that costs.
+   *   - It only ever FOLLOWS. The stick steers `facing`, `facing` pulls this,
+   *     and the pull is what makes `facing == inputYaw` a stable fixed point
+   *     rather than a marginal one.
+   */
+  private inputYaw = 0;
 
   /**
    * The subject's spin rate about up, differenced from `facing`.
@@ -1466,6 +1526,11 @@ export class CameraDirector implements ICameraDirector {
     if (!this.headingPrimed) {
       this.aimYaw = travelYaw;
       this.prevYaw = travelYaw;
+      // Primed from FACING, not `travelYaw`. On a fresh spawn the velocity is
+      // often zero and `travelYaw` falls back to the orientation; on a respawn
+      // mid-run it is the fall line. Either way the first frame's stick has to
+      // resolve against where the character is pointing.
+      this.inputYaw = t.facing;
       this.headingPrimed = true;
     }
 
@@ -1511,6 +1576,11 @@ export class CameraDirector implements ICameraDirector {
       lerp(CAMERA_TUNING.lagHalfLifeSlow, CAMERA_TUNING.lagHalfLifeFast, speed01) *
       lerp(1, 0.45, cf);
     this.aimYaw = dampAngleHL(this.aimYaw, travelYaw, lagHL, dt);
+
+    // THE INPUT BASIS. Deliberately the dullest line in the file: a plain
+    // damped follow of `facing`, with none of the whip, the lead or the buffet
+    // that the rest of this update is built to produce. See `inputYaw`.
+    this.inputYaw = dampAngleHL(this.inputYaw, t.facing, CAMERA_TUNING.inputYawHalfLife, dt);
 
     // Air framing: pull back and rise so the whole arc is legible.
     const airborne = t.mode === MoveMode.Airborne;
@@ -2351,6 +2421,7 @@ export class CameraDirector implements ICameraDirector {
     this.headingPrimed = false;
     this.aimYaw = 0;
     this.yawRate = 0;
+    this.inputYaw = target.facing;
 
     // SPEED FROM THE VELOCITY, NOT FROM `state.speed`.
     //

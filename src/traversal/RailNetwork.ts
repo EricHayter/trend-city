@@ -9,15 +9,28 @@
  * the rail or floats them a metre over it, and both look like an animation bug
  * rather than a geometry one.
  *
- * MOUNTING IS A SWEPT TEST AND THAT IS THE WHOLE FILE
+ * MOUNTING IS A SWEPT TEST, AND THE REASON IS NOT THE ONE THIS SAID
  *
- * At 74 m/s a 120 Hz step moves the character 0.62 m. The mount tolerance is
- * `GRIND.snapRadius` = 2.6 m horizontally, so a point test is not hopeless on
- * paper — but the vertical window is what actually catches a rail, and a jump
- * arc crosses a 4 m tall window in six steps at top speed while the horizontal
- * window passes in eight. Every one of those steps has to be checked as a
- * SEGMENT, because the closest approach between the character's path and the
- * rail almost never lands exactly on a step boundary. `sweepPath` does that.
+ * This file used to argue that a point test would MISS rails: at 74 m/s a 120 Hz
+ * step covers 0.62 m, so a 4 m vertical window passes in six steps and the odds
+ * of sampling one of them inside it are poor. That argument died with the unit
+ * fix. A step covers 0.168 m at top speed, `SOLVER.maxSubstep` caps a probe
+ * segment at 0.35 m either way, and `GRIND.snapRadius` is 2.6 m — so the window
+ * is fifteen-plus steps wide and a point test would land inside it every time.
+ * The same is true of every other probe in this directory, and saying otherwise
+ * in four files would be four comments arguing from a number none of them read.
+ *
+ * The sweep stays, for the two reasons that survive:
+ *
+ *   It returns the CLOSEST APPROACH, not the first sample that happened to be
+ *   in range. That is the point the mount snaps to and the path parameter the
+ *   grind starts from, so a point test would mount you up to a step of travel
+ *   away from where you actually met the rail — cosmetically wrong on a tube
+ *   0.085 m thick, and it costs nothing to be right.
+ *
+ *   It does not depend on the step being small. Everything above is a statement
+ *   about today's speed table and today's `maxSubstep`; the sweep is a statement
+ *   about the geometry. One of those two survives the next retune.
  *
  * ALLOCATION
  *

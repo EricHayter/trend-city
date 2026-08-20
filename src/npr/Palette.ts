@@ -430,17 +430,29 @@ export const RAMPS = {
 
 export type RampName = keyof typeof RAMPS;
 
-// ── Rider identity colours ───────────────────────────────────────────────────
+// ── Character identity colours ───────────────────────────────────────────────
 /**
- * Four riders must be instantly distinguishable at 200m in silhouette-plus-hue.
- * These hues are chosen to sit at the corners of the palette so no two ever
- * read the same against grass, rock, or snow.
+ * The character must stay legible against grass, rock and snow, at any size
+ * the course puts them at.
+ *
+ * This was a four-rider roster when the game was a race, and the brief was that
+ * the four be "instantly distinguishable at 200 m in silhouette-plus-hue". There
+ * is one character now, so there is no longer anyone to be distinguished FROM —
+ * but the requirement did not go away, it changed opponent: the mountain. Warm
+ * red against cold rock and white snow is the same argument, made against the
+ * terrain instead of against a rival's jersey.
+ *
+ * The distance work built for that brief — `CelMaterial`'s size floors, the rim
+ * exponent, the outline taper — is all still load-bearing for exactly this
+ * reason, and reads this palette. Kept as a list because the alternates are
+ * still useful as a costume set, and because the size-floor code is written
+ * against "an identity hue" rather than against one literal.
  */
-export const RIDER_COLORS = [
-  { key: 'player', jersey: c(0xe0574c), accent: c(0xff9a5c), frame: c(0x8a4488), name: 'YOU' },
-  { key: 'kestrel', jersey: c(0x3f9ad9), accent: c(0x7fd8e8), frame: c(0x2f6f9c), name: 'KESTREL' },
-  { key: 'mags', jersey: c(0xf2c14e), accent: c(0xfff0a8), frame: c(0xb8862c), name: 'MAGS' },
-  { key: 'okoye', jersey: c(0x74c96b), accent: c(0xc6f095), frame: c(0x3d8a52), name: 'OKOYE' },
+export const CHARACTER_COLORS = [
+  { key: 'player', jersey: c(0xe0574c), accent: c(0xff9a5c), trim: c(0x8a4488), name: 'YOU' },
+  { key: 'kestrel', jersey: c(0x3f9ad9), accent: c(0x7fd8e8), trim: c(0x2f6f9c), name: 'KESTREL' },
+  { key: 'mags', jersey: c(0xf2c14e), accent: c(0xfff0a8), trim: c(0xb8862c), name: 'MAGS' },
+  { key: 'okoye', jersey: c(0x74c96b), accent: c(0xc6f095), trim: c(0x3d8a52), name: 'OKOYE' },
 ] as const;
 
 // ── HUD ──────────────────────────────────────────────────────────────────────
@@ -552,10 +564,10 @@ export const LINES = {
    */
   corroboration: [0.34, 1.0] as [number, number],
   /**
-   * DISTANCE IDENTITY. `RIDER_COLORS` promises riders are "instantly
-   * distinguishable at 200 m in silhouette-plus-hue", and a plain Fresnel rim
-   * plus fog cannot keep that promise: below about 40 px the rim collapses and
-   * the grade desaturates the jersey toward the terrain.
+   * DISTANCE IDENTITY. `CHARACTER_COLORS` promises the character stays legible
+   * against grass, rock and snow at any size, and a plain Fresnel rim plus fog
+   * cannot keep that promise: below about 40 px the rim collapses and the grade
+   * desaturates the jersey toward the terrain.
    *
    * `fullPx` is the apparent size above which nothing is applied; `floorPx` is
    * where the floors reach full strength. The rim exponent is deliberately
