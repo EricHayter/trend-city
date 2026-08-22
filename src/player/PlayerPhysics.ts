@@ -132,8 +132,17 @@ export class PlayerPhysics {
   /** Blocks remounting the rail just jumped from. */
   private railLock = 0;
   private lastRailIndex = -1;
+  /** Seconds before a grind may switch rails. See `GRIND.switchCooldown`. */
+  private switchLock = 0;
   /** Reduced turn authority after a hard landing. */
   private landRecover = 0;
+
+  /** Seconds the reversed stick has been held. See the pivot in `stepGrounded`. */
+  private pivotWish = 0;
+  /** Seconds left in a committed pivot. 0 when none is running. */
+  private pivotLeft = 0;
+  /** Heading a committed pivot is rotating toward. */
+  private pivotTarget = 0;
   /** Set on the step a dive lands, consumed by whoever spawns the shockwave. */
   slamThisStep = false;
 
@@ -297,7 +306,10 @@ export class PlayerPhysics {
     this.lastWallId = -1;
     this.railLock = 0;
     this.lastRailIndex = -1;
+    this.switchLock = 0;
     this.landRecover = 0;
+    this.pivotWish = 0;
+    this.pivotLeft = 0;
     this.slamThisStep = false;
     this.wallHit = null;
 
@@ -360,6 +372,15 @@ export class PlayerPhysics {
     s.invulnTime = Math.max(0, s.invulnTime - dt);
     this.sameWallLock = Math.max(0, this.sameWallLock - dt);
     this.railLock = Math.max(0, this.railLock - dt);
+    // The ban expires WITH the lockout. `lastRailIndex` used to be set on every
+    // dismount and never cleared, and `tryMountRail` passes it to `findMount` as
+    // the excluded rail whenever the character is not already grinding — so the
+    // last rail ridden was banned for the rest of the run, not for the 0.2 s the
+    // lockout describes. Riding a rail once made it permanently untouchable,
+    // which on a route that doubles back past its own furniture is a traversal
+    // feature quietly deleting itself as the player uses it.
+    if (this.railLock === 0 && this.switchLock === 0) this.lastRailIndex = -1;
+    this.switchLock = Math.max(0, this.switchLock - dt);
     this.landRecover = Math.max(0, this.landRecover - dt);
 
     if (s.attack.comboWindow > 0) {
@@ -470,93 +491,216 @@ export class PlayerPhysics {
       sliding = false;
     }
 
-    // ── Steering: rotate a heading, do not lerp a vector ───────────────────
+    // ── Steering: the velocity owns its own direction ──────────────────────
     //
-    // The heading is a STATE the player owns, seeded from `facing`, and NOT
-    // re-derived from the velocity direction. That distinction is the whole
-    // difference between a platformer and a vehicle, and getting it wrong is
-    // what made this build unplayable.
+    // The MODEL's yaw and the PATH are two different quantities now, and that
+    // separation is the whole of "momentum".
     //
-    // The order of business below is: read the heading, steer it, REBUILD the
-    // velocity along it, then add the along-slope gravity term. So a
-    // velocity-derived heading reads back, one step later, a direction that the
-    // slope term has already rotated toward the fall line — which means the
-    // MOUNTAIN STEERS THE PLAYER. It gets worse, because `CameraDirector` takes
-    // its `travelYaw` from the velocity too and the move stick is resolved
-    // against the camera, so the heading, the camera and the input basis were
-    // all three defined relative to the same drifting vector with nothing
-    // anchoring any of them to the world. Measured with `_camloop.mjs`: holding
-    // nothing but forward on the switchbacks rotated the character continuously
-    // at about 65 deg/s, all the way round the compass and round again, and
-    // holding forward plus a touch of right settled into a perfect circle at
-    // 115 deg/s with the camera pinned 20.9 deg off the nose.
+    // What stood here reduced the velocity to a scalar `h` and rebuilt it along
+    // the heading every step, so direction of travel was identical to facing by
+    // construction — there was no state in which the character moved one way and
+    // pointed another, so there was nothing for momentum to be a property of.
+    // `RUN.grip` has the full account.
     //
-    // Keeping it as a state does not throw the slope away — the term is still
-    // added to the velocity below and still pushes the character sideways
-    // across a face, and `h` still picks up its magnitude. It just no longer
-    // decides which way the character is POINTING. Anything that legitimately
-    // redirects the player — a booster, a dash ring, a wall mount, a rail exit
-    // — re-seats `facing` explicitly at its own call site.
-    let h = Math.hypot(s.velocity.x, s.velocity.z);
-    let heading = s.facing;
+    // Its comment argued, correctly for the code as it then stood, that deriving
+    // the heading from the velocity let the MOUNTAIN steer the player: the slope
+    // term rotated the velocity, the heading read it back, and `CameraDirector`
+    // took its `travelYaw` from the same vector while the stick was resolved
+    // against the camera — three quantities defined against each other and none
+    // against the world, measured at 65 deg/s of continuous unrequested rotation.
+    //
+    // That loop is broken at the camera end. The camera's yaw is the player's and
+    // reads neither velocity nor facing (see `CAMERA_TUNING.yawDeadzone`), so the
+    // stick basis is a fixed world direction for as long as the player's hand is
+    // still. With nothing feeding back, a velocity that owns its direction is
+    // simply correct, and the slope can DEFLECT the player — which is what a
+    // mountain is for — without steering them.
+
+    let vx = s.velocity.x;
+    let vz = s.velocity.z;
+    let h = Math.hypot(vx, vz);
 
     const fast = clamp01(h / RUN.max);
     let turnRate = lerp(RUN.turnRateLow, RUN.turnRateHigh, fast);
-    // A slide trades turn authority for the speed it keeps. A hard landing
-    // costs authority for a moment, which is the whole penalty for a big fall.
+    // A slide trades turn authority for the speed it keeps. A hard landing costs
+    // authority for a moment, which is the whole penalty for a big fall.
     if (sliding) turnRate *= 0.45;
     if (this.landRecover > 0) turnRate *= 0.35;
 
+    // The model's yaw. Steers toward the stick, and is what jumps, dashes, rail
+    // mounts and the homing cone read. It no longer decides the path.
+    let heading = s.facing;
     let braking = false;
+    let pivoting = false;
+    // The direction the VELOCITY is being asked to become. Defaults to the way it
+    // is already going, so a released stick leaves the decomposition a no-op.
+    let askYaw = h > 0.4 ? Math.atan2(vx, vz) : heading;
 
     if (wishMag > 0) {
       const d = angleDelta(heading, wishYaw);
       const absD = Math.abs(d);
 
-      // The pivot. Reversing above `pivotSpeed` is a deliberate, costed action
-      // that throws away all but `quickTurnKeep` of the speed and turns on the
-      // spot, rather than a slow 180 the player fights the physics through.
-      if (absD > 2.36 && h > RUN.pivotSpeed && !sliding) {
-        h *= RUN.quickTurnKeep;
-        heading = wishYaw;
-      } else if (absD > 2.36 && !sliding) {
-        // Below pivot speed there is nothing to conserve — just face it.
-        heading = wishYaw;
+      // THE PIVOT. A reversal is a deliberate, costed quick-turn rather than a
+      // slow 180 the player fights the physics through — debounced over
+      // `pivotHold` and spread over `pivotTime`, because it used to fire off a
+      // single step's stick reading and assign the heading outright. See
+      // `RUN.pivotHold` for the sawtooth that produced.
+      //
+      // It is the one thing that still moves the velocity rigidly: a quick-turn
+      // that left the old momentum arcing away would not be a quick-turn.
+      const wantsPivot = absD > 2.36 && !sliding;
+      this.pivotWish = wantsPivot ? this.pivotWish + dt : 0;
+
+      if (this.pivotLeft > 0) {
+        // Rate to arrive exactly on target on the last step, so the turn neither
+        // overshoots nor stalls short if `dt` varies.
+        const rem = angleDelta(heading, this.pivotTarget);
+        heading += dt >= this.pivotLeft ? rem : rem * (dt / this.pivotLeft);
+        this.pivotLeft -= dt;
+        pivoting = true;
+      } else if (wantsPivot && this.pivotWish >= RUN.pivotHold) {
+        this.pivotTarget = wishYaw;
+        this.pivotLeft = RUN.pivotTime;
+        this.pivotWish = 0;
+        pivoting = true;
+        // The cost, paid once. Only above `pivotSpeed` — below it there is no
+        // momentum worth conserving and charging for a turn-in-place is a tax on
+        // walking.
+        if (h > RUN.pivotSpeed) h *= RUN.quickTurnKeep;
       } else {
         const maxTurn = turnRate * dt;
         heading += absD < maxTurn ? d : Math.sign(d) * maxTurn;
+        askYaw = wishYaw;
       }
     } else if (!sliding) {
       braking = true;
+      this.pivotWish = 0;
+      // A pivot already under way finishes even if the player lets go. It is a
+      // committed movement, and stopping it half-turned would leave the character
+      // facing across their own velocity with no input to explain why.
+      if (this.pivotLeft > 0) {
+        const rem = angleDelta(heading, this.pivotTarget);
+        heading += dt >= this.pivotLeft ? rem : rem * (dt / this.pivotLeft);
+        this.pivotLeft -= dt;
+        pivoting = true;
+        braking = false;
+      }
     }
 
-    // ── Speed along the heading ────────────────────────────────────────────
+    // ── A REQUEST CANNOT POINT INTO A FACE TOO STEEP TO STAND ON ───────────
+    //
+    // This is the fix for the character welding themselves to the mountain, and
+    // the mechanism is the interaction between two lines that are each correct on
+    // their own. The step below drives the velocity toward `askYaw`; the
+    // collision resolve, on a face steeper than `SLOPE.walkableNormalY`, cancels
+    // whatever part of the velocity drives into that face. Put a player against
+    // such a face with the stick held toward it and the two run in a loop: the
+    // request points them at the hill, the resolve deletes it, the request points
+    // them at the hill again. The steady state is one step's acceleration,
+    // `RUN.accelLow * dt`, which is 0.136 m/s.
+    //
+    // Measured with tools/capture/_playthrough.mjs. Route distance 1130, 18 m off
+    // the centreline, thirteen seconds at 0.1 to 0.3 m/s flickering between
+    // Grounded and Sliding, and the only escape was a rail that happened to pass.
+    //
+    // So the request is projected out of the hill before it is used. The
+    // horizontal part of a heightfield normal points DOWNHILL, so uphill is its
+    // negation; a request with a positive uphill component has that component
+    // removed and what is left is the along-face direction on whichever side the
+    // player was already asking for. A request pointed straight up the face has
+    // no side to keep and falls to straight down it.
+    //
+    // Note what this does NOT do: it never touches a walkable slope. Running
+    // uphill is ordinary movement and the whole point of momentum being a
+    // resource, so the gate is the same threshold the resolve itself uses. It is
+    // applied to `heading` as well, or the model would face into a cliff it
+    // cannot travel toward.
+    if (n.y < SLOPE.walkableNormalY) {
+      const nl = Math.hypot(n.x, n.z);
+      if (nl > EPS) {
+        const ux = -n.x / nl;
+        const uz = -n.z / nl;
+        const deHill = (yaw: number): number => {
+          let hx = Math.sin(yaw);
+          let hz = Math.cos(yaw);
+          const up = hx * ux + hz * uz;
+          if (up <= 0) return yaw;
+          hx -= ux * up;
+          hz -= uz * up;
+          const hl = Math.hypot(hx, hz);
+          // Straight into the face: no along-face side survives, so take the
+          // fall line. Anything else would be an arbitrary choice of side.
+          return hl > 1e-3 ? Math.atan2(hx / hl, hz / hl) : Math.atan2(-ux, -uz);
+        };
+        askYaw = deHill(askYaw);
+        heading = deHill(heading);
+      }
+    }
+
+    // ── Speed along the request, GRIP across it ────────────────────────────
     const boostGain = s.boosting ? BOOST.accel : 0;
     const target = s.boosting
       ? BOOST.max
       : RUN.floorSpeed + (RUN.max - RUN.floorSpeed) * wishMag;
 
-    if (sliding) {
-      // A slide never accelerates from input. It coasts, and it keeps speed
-      // far better than running does — which is why it is worth doing on a
-      // descent and pointless on the flat.
-      h = Math.max(0, h - SLIDE.friction * dt);
+    if (pivoting) {
+      // Rigid. A quick-turn takes the momentum with it, at the cost already paid.
+      vx = Math.sin(heading) * h;
+      vz = Math.cos(heading) * h;
     } else if (braking) {
-      h = Math.max(0, h - RUN.friction * dt);
-    } else if (input.crouch && h > 1) {
-      h = Math.max(0, h - RUN.brake * dt);
-    } else if (h < target) {
-      const accel = (h < RUN.gearSpeed ? RUN.accelLow : RUN.accelHigh) + boostGain;
-      h = Math.min(target, h + accel * dt);
-    } else if (h > RUN.max) {
-      // Overspeed from a dash, a slope or a booster decays gently. See
-      // RUN.overDecay — using RUN.friction here throws the dash away.
-      h = Math.max(RUN.max, h - RUN.overDecay * dt);
+      // Coast. Friction on the vector, direction untouched — the character keeps
+      // going the way they were going, which is the point.
+      const k = h > EPS ? Math.max(0, h - RUN.friction * dt) / h : 0;
+      vx *= k;
+      vz *= k;
+    } else {
+      const ax = Math.sin(askYaw);
+      const az = Math.cos(askYaw);
+      // ALONG accelerates and is capped. ACROSS is bled by grip and nothing else
+      // touches it. Running straight the across term is zero and this is
+      // arithmetically the old model.
+      let along = vx * ax + vz * az;
+      let cx = vx - along * ax;
+      let cz = vz - along * az;
+      const across = Math.hypot(cx, cz);
+
+      if (across > EPS) {
+        // Grip rises as speed falls: below walking pace there is no momentum
+        // worth modelling and a platformer needs its footwork crisp.
+        const gripRate =
+          (sliding ? RUN.gripSlide : RUN.grip) *
+          lerp(RUN.gripLowScale, 1, clamp01(h / RUN.gripLowSpeed));
+        const k = Math.max(0, across - gripRate * dt) / across;
+        cx *= k;
+        cz *= k;
+      }
+
+      if (sliding) {
+        // A slide never accelerates from input. It coasts, and it keeps speed far
+        // better than running does — which is why it is worth doing on a descent
+        // and pointless on the flat.
+        along -= Math.sign(along) * Math.min(Math.abs(along), SLIDE.friction * dt);
+      } else if (input.crouch && h > 1) {
+        along -= Math.sign(along) * Math.min(Math.abs(along), RUN.brake * dt);
+      } else if (along < target) {
+        // `along` may be negative — the player has asked for a direction more
+        // than 90 degrees off travel. `accelLow` then reads as the authority to
+        // turn the run around, which is what it should be.
+        const accel = (along < RUN.gearSpeed ? RUN.accelLow : RUN.accelHigh) + boostGain;
+        along = Math.min(target, along + accel * dt);
+      } else if (along > RUN.max) {
+        // Overspeed from a dash, a slope or a booster decays gently. See
+        // RUN.overDecay — using RUN.friction here throws the dash away.
+        along = Math.max(RUN.max, along - RUN.overDecay * dt);
+      }
+
+      vx = ax * along + cx;
+      vz = az * along + cz;
     }
 
-    // ── Rebuild the horizontal velocity, then add along-slope gravity ──────
-    s.velocity.x = Math.sin(heading) * h;
-    s.velocity.z = Math.cos(heading) * h;
+    h = Math.hypot(vx, vz);
+    s.velocity.x = vx;
+    s.velocity.z = vz;
 
     // The horizontal part of a heightfield normal points DOWNHILL, and the
     // horizontal component of gravity resolved into the surface plane is
@@ -960,6 +1104,27 @@ export class PlayerPhysics {
     this.railSpeed -= GRIND.drag * dir * dt;
     this.railSpeed = clamp(this.railSpeed, -RUN.hardMax, RUN.hardMax);
 
+    // FALL OFF WHEN TOO SLOW. `GRIND.minSpeed` promises this in its own doc and
+    // for the whole life of the grind nothing here read it — see that comment for
+    // the mechanism. Without this branch a rail that flattens or climbs lets drag
+    // walk `railSpeed` to zero while `railDistance` stays strictly between 0 and
+    // `len`, so the end-of-rail exit below never fires and there is no exit at
+    // all: the character is parked mid-rail, facing wherever a zero-length
+    // velocity put them, unable to push off because the input term is a dot
+    // product with that same dead facing.
+    //
+    // Tested before the distance integration so the stall is caught on the step
+    // it happens rather than one step of drift later, and the velocity handed to
+    // the fall is the tangent at the speed actually carried, so dropping off a
+    // rail conserves momentum the way every other dismount does.
+    if (Math.abs(this.railSpeed) < GRIND.minSpeed) {
+      s.velocity.copy(this.railSample.tangent).multiplyScalar(this.railSpeed);
+      this.railLock = GRIND.stallLockout;
+      this.lastRailIndex = s.railIndex;
+      this.dismountRail();
+      return;
+    }
+
     s.railDistance += this.railSpeed * dt;
 
     const len = rails.lengthOf(s.railIndex);
@@ -978,13 +1143,27 @@ export class PlayerPhysics {
     s.position.copy(this.railSample.position);
     s.velocity.copy(this.railSample.tangent).multiplyScalar(this.railSpeed);
     s.groundNormal.copy(this.railSample.up);
-    s.facing = Math.atan2(s.velocity.x, s.velocity.z);
+    // Off the TANGENT and the travel direction, not off the velocity. They agree
+    // whenever the speed is meaningful, and the difference is what happens when it
+    // is not: `atan2(0, 0)` is 0, so a stalled rail used to snap the character to
+    // due north and, because the player's push is a dot product against `facing`,
+    // took the controls with it. The stall branch above means the speed can no
+    // longer reach zero here, and this makes the facing independent of it anyway.
+    s.facing = Math.atan2(
+      this.railSample.tangent.x * dir,
+      this.railSample.tangent.z * dir,
+    );
   }
 
   private railSpeed = 0;
 
   private mountRail(index: number, distance: number, sample: RailSample): void {
     const s = this.state;
+    // Captured before `setMode` below overwrites it: a mount that REPLACES a
+    // grind is a switch, and a switch owes the next one a cooldown and a ban on
+    // the rail it just left.
+    const switching = s.mode === MoveMode.Grinding;
+    const leaving = s.railIndex;
     const along = s.velocity.dot(sample.tangent);
     const dir = along >= 0 ? 1 : -1;
     // Mounting hands you `GRIND.mountFloor` if you arrived slower than that.
@@ -998,6 +1177,10 @@ export class PlayerPhysics {
     s.railMountedThisStep = true;
     this.refreshAirCharges();
     this.setMode(MoveMode.Grinding);
+    if (switching) {
+      this.switchLock = GRIND.switchCooldown;
+      this.lastRailIndex = leaving;
+    }
     this.audio?.playRailMount();
   }
 
@@ -1208,8 +1391,16 @@ export class PlayerPhysics {
           if (s.velocity.y < 0) s.velocity.y *= 0.35;
         }
         s.groundNormal.copy(_v2);
-        // A face in the wall-runnable band is a wall-run candidate, not ground.
-        if (_v2.y > WALL.maxNormalY && s.mode === MoveMode.Grounded) {
+        // ANY face too steep to stand on puts a grounded character into a slide.
+        //
+        // This used to require `_v2.y > WALL.maxNormalY` as well, which is the
+        // band between wall-runnable and walkable — so on the STEEPEST faces, the
+        // ones past 66 degrees, the character stayed nominally Grounded. The
+        // comment justified it as leaving those to the wall-run, but a wall-run
+        // needs `WALL.mountSpeed` and an airborne or dashing mode, and a
+        // character pressed against a cliff at 0.2 m/s has neither. So the
+        // steepest faces were the only ones with no mode that could handle them.
+        if (s.mode === MoveMode.Grounded) {
           this.slideTime = 0;
           this.setMode(MoveMode.Sliding);
         }
@@ -1318,29 +1509,63 @@ export class PlayerPhysics {
     //
     // Measured with `tools/capture/_railprobe.mjs`: rails-first left plates 6,
     // 8 and 11 unmountable, each one grinding instead for 46-59 of 60 steps.
+    //
+    // ALREADY ON A WALL: neither probe runs, and the rail probe in particular
+    // must not. `airborne` below is Airborne-or-Dashing, so WallRun fell into the
+    // ground branch and asked the RAIL first — 120 times a second, for the whole
+    // run, while the character was attached to a plate whose face by construction
+    // sits about 20 cm from a route rail. The report is exact: "wall running
+    // doesnt work (runnign on walls goes onto the rails instead for some
+    // reason)". The reason is this branch.
+    //
+    // Leaving a wall for a rail is a jump, and the jump goes through Airborne,
+    // where the rail probe is waiting.
+    if (s.mode === MoveMode.WallRun) return;
+
     const airborne = s.mode === MoveMode.Airborne || s.mode === MoveMode.Dashing;
     if (airborne) {
       if (this.tryMountWall(from, to)) return;
-      this.tryMountRail(from, to);
+      this.tryMountRail(from, to, input);
     } else {
-      if (this.tryMountRail(from, to)) return;
+      if (this.tryMountRail(from, to, input)) return;
       this.tryMountWall(from, to);
     }
-
-    void input;
   }
 
   /** Mount a rail if one is in reach. Returns whether the mode changed. */
-  private tryMountRail(from: Vector3, to: Vector3): boolean {
+  private tryMountRail(from: Vector3, to: Vector3, input: PlayerInput): boolean {
     const s = this.state;
     const t = this.traversal;
     if (!t) return false;
     if (s.mode === MoveMode.Hurt || s.mode === MoveMode.Homing) return false;
+    // Attached to a plate. `probeTraversal` already returns before reaching here,
+    // and this is the second lock on the same door because the first one was a
+    // branch condition somebody could reasonably widen.
+    if (s.mode === MoveMode.WallRun) return false;
     if (s.speed < GRIND.minSpeed || this.railLock > 0) return false;
+
+    // A SWITCH IS NOT A MOUNT. This probe runs on every step in every
+    // non-airborne mode, so while the character is already grinding it is asking
+    // "should I be on a different rail" 120 times a second — and `mountRail`
+    // answers by re-seating `railDistance` and `position`. Two rails inside
+    // `snapRadius` therefore took turns owning the character and pinned them in
+    // place forever. `GRIND.switchCooldown` has the measurement.
+    //
+    // Both halves are load-bearing. The cooldown commits the character to the new
+    // rail long enough to travel further than the radius the pair were trading
+    // inside of, and the gesture check means an unasked-for switch cannot happen
+    // at all — the rail you are on is the rail you chose.
+    if (s.mode === MoveMode.Grinding) {
+      if (this.switchLock > 0) return false;
+      if (Math.abs(input.moveX) < GRIND.switchAsk) return false;
+    }
 
     const exclude = s.mode === MoveMode.Grinding ? s.railIndex : this.lastRailIndex;
     const m = t.rails.findMount(from, to, s.velocity, exclude);
     if (!m || (s.mode === MoveMode.Grinding && m.index === s.railIndex)) return false;
+    // The rail just left is banned for the cooldown, so a pair cannot alternate
+    // even once the cooldown expires on a step where both are still in reach.
+    if (m.index === this.lastRailIndex && this.switchLock > 0) return false;
     this.mountRail(m.index, m.distance, m.sample);
     return true;
   }

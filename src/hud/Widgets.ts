@@ -340,6 +340,31 @@ export abstract class Widget {
     this.layer.slideY = this.enterY * (1 - t);
   }
 
+  /**
+   * Take the panel off screen on this frame, with no exit animation at all.
+   *
+   * Both presence helpers above animate the exit, and for most panels that is
+   * right — a leaving panel showing its own last frame is a transition, and a
+   * transition reads as intent. It is wrong for a panel that is being replaced
+   * by another panel, because then there is a window in which both are drawing
+   * and the viewer has two mutually exclusive statements about what to look at.
+   * Softening the alpha does not help: at 13% it reads as a draw that failed,
+   * and at full alpha it reads as two modals stacked. There is no alpha at which
+   * a results table over a countdown is not a bug.
+   *
+   * So this is the third option — do not be on screen. `vis` and `want` both go
+   * to zero so nothing damps back up from a stale value, and the slide is parked
+   * at the entrance offset so the next appearance flies in from the right place
+   * rather than from wherever the exit was interrupted.
+   */
+  snapOff(): void {
+    this.want = 0;
+    this.vis = 0;
+    this.layer.alpha = 0;
+    this.layer.slideX = this.enterX;
+    this.layer.slideY = this.enterY;
+  }
+
   get shown(): boolean {
     return this.vis > 0.002;
   }

@@ -7,6 +7,7 @@
 
 import { Engine } from './core/Engine';
 import { Game } from './game/Game';
+import { POST_STATE } from './npr/NprGlobals';
 
 const bootEl = document.getElementById('boot');
 const bootBar = document.getElementById('boot-bar') as HTMLElement | null;
@@ -40,7 +41,12 @@ async function boot(): Promise<void> {
   engine.start();
 
   // Exposed for the Playwright capture harness — see tools/capture/.
-  (window as unknown as Record<string, unknown>).__DESCENT__ = { engine, game };
+  //
+  // `POST_STATE` is in there because the post effects are ramped against player
+  // speed and several of those ramps were mis-ranged in ways no screenshot can
+  // settle — an effect pinned at full strength and an effect correctly at full
+  // strength look identical. The probes read the published intensity instead.
+  (window as unknown as Record<string, unknown>).__DESCENT__ = { engine, game, POST_STATE };
 }
 
 boot().catch((err) => {

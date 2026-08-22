@@ -54,9 +54,18 @@ const WANT_VIDEO = Boolean(args.video);
  * see: wide composition, silhouette against sky, silhouette against tree line,
  * three-quarter rider close-up, high-speed, mid-air, and a crash.
  */
+// Fallbacks only — `info.poses` / `info.sequences` come off the live game and win
+// whenever they are non-empty. Kept in step with Game.ts's SITUATIONS and
+// SEQUENCES anyway, because a stale fallback does not error, it silently shoots
+// nothing: this list still named `bike-detail`, `streambed`, `trick-360` and
+// `pack-race` long after the project stopped being about a bike and those four
+// situations stopped existing.
 const DEFAULT_POSES = [
   'summit-wide',
   'summit-rider',
+  'rider-closeup',
+  'rider-threequarter',
+  'run-cycle',
   'scree-speed',
   'switchback-lean',
   'treeline-silhouette',
@@ -64,25 +73,17 @@ const DEFAULT_POSES = [
   'tabletop-air',
   'ravine-gap',
   'ridge-exposure',
-  'streambed',
   'finish-sprint',
-  'rider-closeup',
-  'rider-threequarter',
-  'bike-detail',
-  'crash',
   'valley-vista',
+  'rail-line',
+  'boost-pad',
+  'dash-ring',
 ];
 
-/** Motion sequences: [name, seconds]. */
 const DEFAULT_SEQUENCES = [
-  ['launch', 1.6],
-  ['switchback', 2.0],
   ['tabletop-air', 2.4],
-  ['landing', 1.4],
-  ['crash', 2.0],
   ['scree-speed', 1.8],
-  ['trick-360', 2.2],
-  ['pack-race', 3.0],
+  ['air-dash', 2.0],
 ];
 
 async function main() {

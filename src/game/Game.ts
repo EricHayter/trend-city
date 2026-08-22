@@ -86,6 +86,18 @@ export interface CaptureApi {
   takeControl(): void;
   releaseControl(): void;
   step(dt: number): void;
+  /**
+   * Redraw the current state without advancing it.
+   *
+   * For A/B probes, which need two frames of the SAME instant with one uniform
+   * changed between them — an override on `PostPipeline`'s composite is the only
+   * difference that may exist, so stepping physics between the grabs is not an
+   * option. Several probes were already calling `capture.render?.()`, which
+   * silently did nothing because the method did not exist; the optional-call
+   * turned a missing handle into a stale framebuffer, and the diff came back as
+   * a flat zero for a control that could not possibly be zero.
+   */
+  render(): void;
   setPose(name: string): boolean;
   setSequence(name: string): boolean;
   listPoses(): string[];
@@ -270,6 +282,29 @@ const _pickFrom = new Vector3();
 const _pickUp = new Vector3(0, 1, 0);
 
 /**
+ * Scratch for `Input.drainLook`. Module-scoped because `render()` runs every
+ * frame and a two-field object literal there is a per-frame allocation for no
+ * reason.
+ */
+const _look = { x: 0, y: 0 };
+
+/**
+ * Seconds Enter must be held to throw a live run away. See `handleUiInput`.
+ *
+ * Long enough to be a decision and short enough not to feel like the key is
+ * broken. A tap does nothing at all, which is the point.
+ */
+const RESTART_HOLD = 0.55;
+
+/**
+ * Seconds a menu screen ignores Enter after appearing.
+ *
+ * The results screen is the case that matters: it arrives while the player's
+ * finger is still on the key that got them there.
+ */
+const MENU_ARM_DELAY = 0.7;
+
+/**
  * Collection radius, metres.
  *
  * 1.5 — a little wider than the character's hull, because the pickup line is a
@@ -321,6 +356,13 @@ export class Game {
    * harness contaminating the thing it exists to review.
    */
   private suppressPopupFrames = 0;
+
+  /** Seconds Enter has been held during a live run. See `handleUiInput`. */
+  private restartHeld = 0;
+  /** Seconds the current menu screen has been up, for the Enter arm delay. */
+  private menuAge = 0;
+  /** The frame's real dt, so the UI timers do not run on the slow-mo clock. */
+  private uiDt = 0;
   /** Physics steps until a scripted capture hit fires. 0 = none pending. */
   private pendingHurtSteps = 0;
   /**
@@ -358,6 +400,10 @@ export class Game {
   constructor(engine: Engine, options: GameOptions) {
     this.engine = engine;
     this.input = new Input(window);
+    // The mouse needs an element to lock to, and `Input` is deliberately ignorant
+    // of the renderer, so the canvas is handed over here. A click on it locks; the
+    // browser's own Escape releases.
+    this.input.attachPointerLock(this.engine.renderer.domElement);
     this.headless = options.params.get('capture') === '1';
 
     this.capture = {
@@ -376,6 +422,10 @@ export class Game {
         this.engine.start();
       },
       step: (dt: number) => this.engine.stepManual(dt),
+      // A zero-dt step. `Engine.advance` adds dt to the accumulator, runs no
+      // fixed steps because nothing crossed the threshold, and then renders
+      // unconditionally — so this is a pure redraw. See `CaptureApi.render`.
+      render: () => this.engine.stepManual(0),
       setPose: (name: string) => this.applySituation(name),
       setSequence: (name: string) => {
         const s = SEQUENCES[name];
@@ -710,7 +760,7 @@ export class Game {
   private render(realDt: number, alpha: number, elapsed: number): void {
     this.input.update(realDt);
     if (!this.captureControlled) this.queueEdges();
-    this.handleUiInput();
+    this.handleUiInput(realDt);
 
     // Slow-mo and the impact-frame hold both live in the effects layer, and
     // everything downstream of here runs on the SCALED dt so a held frame holds
@@ -724,6 +774,22 @@ export class Game {
     this.player.updateVisual(alpha, dt, elapsed);
 
     // 2. Camera reads the resolved player transform.
+    //
+    // Look and steer are handed over FIRST, because both are inputs to the same
+    // update: the look delta moves the orbit, and the steer angle decides whether
+    // the input basis is allowed to keep following the character this frame. On
+    // the real dt, not the scaled one — a slow-mo frame must not make the mouse
+    // feel heavy, and `look()` takes a delta that is already in radians.
+    // NOT behind `captureControlled`, and that matters. Both of these read
+    // `input.intent`, which is exactly what a scripted caller writes — gating them
+    // on hardware input is the same trap `Input.synthMoveFromButtons` documents:
+    // the harness sets the stick, the game ignores it, and the failure is silent.
+    // `_circle.mjs` measured a camera fix as having changed nothing at all for
+    // this reason. Under capture `lookX` is always 0, so the drain is a no-op
+    // there rather than a hazard.
+    this.input.drainLook(_look);
+    this.effects.cameraDirector.look(_look.x, _look.y);
+    this.effects.cameraDirector.steer(this.input.intent.moveX, this.input.intent.moveZ);
     const state = this.player.state;
     this.effects.cameraDirector.update(state, dt, elapsed, realDt);
 
@@ -768,14 +834,56 @@ export class Game {
     return clamp01(0.25 + (cam.position.y - h) * 0.02 + h / 900);
   }
 
-  private handleUiInput(): void {
+  private handleUiInput(realDt: number): void {
     if (this.captureControlled) return;
+    this.uiDt = realDt;
     const b = this.input.intent.buttons;
     if (b.pause.justPressed) {
       if (this.stage.phase === StagePhase.Paused) this.stage.resume();
-      else this.stage.pause();
+      else {
+        this.stage.pause();
+        // A pause menu the player cannot point at is not a menu. Releasing the
+        // lock also stops mouse movement over the menu from swinging the camera
+        // behind it.
+        this.input.releasePointerLock();
+      }
     }
-    if (b.restart.justPressed) this.restart();
+
+    // RESTART, AND WHY IT IS NOT A BARE `justPressed` ANY MORE.
+    //
+    // Enter was bound straight through to `restart()`. Two separate problems with
+    // that, and the player hits both:
+    //
+    //   Mid-run it means one keystroke throws the descent away, with no gesture
+    //   that distinguishes intent from a mistyped key. On the mountain it now
+    //   wants `RESTART_HOLD` seconds of contact.
+    //
+    //   On a results screen the player's hand is ALREADY on Enter — they pressed
+    //   it to get there, or they are holding it from the run — so the restart
+    //   fired on the first frame the screen existed and the screen was gone
+    //   before it could be read. Menu screens now arm after `MENU_ARM_DELAY`, and
+    //   because `heldFor` is the time the key has been down, a key that was
+    //   already down when the screen appeared cannot satisfy the arm either.
+    //
+    // KeyR ('reset') is still instant, and should be: it only moves the character
+    // back to the line and leaves the clock alone.
+    const inMenu =
+      this.stage.phase === StagePhase.Results ||
+      this.stage.phase === StagePhase.Cleared ||
+      this.stage.phase === StagePhase.Failed ||
+      this.stage.phase === StagePhase.Paused ||
+      this.stage.phase === StagePhase.Title;
+    if (inMenu) {
+      this.menuAge += this.uiDt;
+      if (b.restart.justPressed && this.menuAge >= MENU_ARM_DELAY) this.restart();
+    } else {
+      this.menuAge = 0;
+      this.restartHeld = b.restart.pressed ? this.restartHeld + this.uiDt : 0;
+      if (this.restartHeld >= RESTART_HOLD) {
+        this.restartHeld = 0;
+        this.restart();
+      }
+    }
     if (b.reset.justPressed) this.respawn();
     if (b.toggleDebug.justPressed) {
       this.debugOverlay = !this.debugOverlay;
@@ -783,11 +891,19 @@ export class Game {
     }
   }
 
-  /** Whole run from the top. */
+  /**
+   * Whole run from the top.
+   *
+   * `stage.restart()` ALREADY calls `begin()`, so the third line used to run it a
+   * second time and every restart went through two Countdown entries with a
+   * `resetRun()` wipe between them. Ordered so the wipe happens once and last:
+   * `respawn()` calls `stage.resetRun()` and `hud.resetRun()` itself, and it is
+   * what sets `suppressPopupFrames`, so anything that pushes a popup has to run
+   * before it rather than after.
+   */
   private restart(): void {
     this.stage.restart();
     this.respawn();
-    this.stage.begin();
   }
 
   /**

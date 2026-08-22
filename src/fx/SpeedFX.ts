@@ -1339,14 +1339,19 @@ export class SpeedFX {
       const spin = Math.min(this.omega.length(), SPEED_TUNING.omegaCeiling);
       const whipping =
         (state.mode === MoveMode.Airborne || state.mode === MoveMode.Hurt) && state.speed > 3;
-      // Onset at 15 m/s (54 km/h) rather than 19 (68 km/h). The old floor sat
-      // above almost every speed the course is actually ridden at, so the
-      // geometry smear — the one that streaks a limb during a trick — was
-      // effectively dead code outside a full-tuck sprint.
-      // Onset at 40 m/s, full by 66 — the top half of the speed range, so the
-      // geometry smear is the thing that says "this is fast even for this
-      // character" rather than a texture over the whole run.
-      const fromSpeed = clamp01((state.speed - 40) / 26) * 0.68;
+      // Onset at `RUN.max`, full at `RUN.hardMax`, and READ from the table
+      // rather than restated. It was `(state.speed - 40) / 26`, absolutes from
+      // when `RUN.max` was 74 Spark display units; after the unit fix top speed
+      // is 20.2 m/s and 3D speed never reaches 40 anywhere on the course, so
+      // this term was dead — the geometry smear only ever fired from `fromSpin`.
+      //
+      // The band is the same one the speed lines use and for the same reason:
+      // running at `RUN.max` is the speed the game is PLAYED at, so anything
+      // that onsets below it is a texture over the whole descent rather than a
+      // signal. Above it means a dash, a booster, a dash ring or a steep gully —
+      // speed the player earned, which is when a streaked limb means something.
+      const fromSpeed =
+        clamp01((state.groundSpeed - RUN.max) / (RUN.hardMax - RUN.max)) * 0.68;
       const fromSpin = whipping ? clamp01((spin - 4.2) / 6.5) * 0.9 : 0;
       const amount = Math.max(fromSpeed, fromSpin);
       if (amount > 0.02) {
@@ -1432,8 +1437,24 @@ export class SpeedFX {
     let targetRadial = 0;
 
     if (state) {
+      // `groundSpeed`, NOT `speed`. `speed` is `velocity.length()` — the 3D
+      // magnitude — and on the ground `velocity.y` is derived from the floor
+      // normal, so it is the horizontal speed divided by the cosine of the
+      // grade. Both ends of this ramp are horizontal ceilings out of `RUN`, so
+      // dividing a 3D numerator by them compares two different quantities and
+      // the ratio picks up a factor of 1/cos(grade) that has nothing to do with
+      // how fast the player is going. On the 46 deg scree face at d=392-440 that
+      // factor is 1.46, and a lawful 21.6 m/s of running reads as 31.5 — over
+      // `hardMax`, so the ramp saturated there no matter where the ceiling was
+      // put. That is exactly why re-ranging the pair below changed the frame at
+      // the start line and not on the face.
+      //
+      // It is also the number on the HUD dial (`StageDirector.speedDisplay` is
+      // `groundSpeed * SPARK_UNITS_PER_MPS`), so the rays and the readout now
+      // ramp together instead of disagreeing on steep ground.
       const v01 = clamp01(
-        (state.speed - SPEED_TUNING.lineFloor) / (SPEED_TUNING.lineCeiling - SPEED_TUNING.lineFloor),
+        (state.groundSpeed - SPEED_TUNING.lineFloor) /
+          (SPEED_TUNING.lineCeiling - SPEED_TUNING.lineFloor),
       );
       // Non-linear on purpose. A linear ramp puts half the effect on at half
       // speed, and the player never registers the difference between "quite

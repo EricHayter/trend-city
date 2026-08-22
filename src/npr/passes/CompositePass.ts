@@ -272,7 +272,34 @@ const FRAGMENT = /* glsl */ `
       // can see, which is the correct axis.
       float paint = stroke * uSpeedIntensity * live * 0.62;
       float edge  = rim * uSpeedIntensity * live * 0.85;
-      col = mix(col, uSpeedColor, saturate1(paint + edge));
+
+      // ── AND MIXED IN THE PERCEPTUAL DOMAIN, NOT IN LINEAR LIGHT ────────────
+      //
+      // The paragraph above is right that the coefficient should read as
+      // "fraction of the way to a white frame" and wrong that it did. col is
+      // LINEAR here and gets encoded on the way out, so a linear-domain mix of
+      // paint toward paper is only worth paint perceptually against a
+      // mid-bright background. Against dark rock it is worth several times more:
+      // scree at linear 0.02 encodes to 40/255, mixing 11.7% toward paper puts it
+      // at linear 0.123 which encodes to 99/255, and a coefficient the comment
+      // called 4.5% has moved the pixel 23% of the way up the visible range.
+      // Darker ground is worse. The effect therefore had almost none of the
+      // speed-dependence it was tuned for — it read as near-full-strength blinds
+      // over anything dim, which is most of a mountain in shadow.
+      //
+      // MEASURED with tools/capture/_lineab.mjs, which forces uSpeedIntensity
+      // through syncState and diffs two renders of the same instant. On the 46
+      // deg scree face at a published intensity of 0.188, the field moved 20.6%
+      // of the frame at a mean delta of 35/255 — against 19.7% at 70/255 for the
+      // same field forced to 1.0. Half the visible strength of a full-blast
+      // effect, at a fifth of the speed range. (That probe first reported a flat
+      // zero for both, because capture.render did not exist and the two grabs
+      // read one stale framebuffer. See CaptureApi.render.)
+      //
+      // Encoding, mixing and decoding costs two pow() on the few pixels a stroke
+      // covers and makes the coefficient mean what it says at every brightness.
+      float amount = saturate1(paint + edge);
+      col = srgbToLinear(mix(linearToSrgb(col), linearToSrgb(uSpeedColor), amount));
     }
 
     if (uDebug > 2.5 && uDebug < 3.5) { fragColor = vec4(linearToSrgb(col), 1.0); return; }

@@ -37,6 +37,25 @@
  *     a rendered frame consumes two or more steps, so `Game` converts an edge
  *     into a single-step pulse itself. See `Game.buildPlayerInput`.
  *
+ *  3. THERE IS A LOOK CHANNEL, and it is a DELTA rather than a level.
+ *
+ *     A mouse has no centre to return to, so `lookX` cannot be an axis the way
+ *     `moveX` is — it is radians of yaw the player asked for since the last
+ *     drain, and `Game` drains it every frame. A right stick IS a level, so its
+ *     contribution is multiplied by the frame's dt before it goes into the same
+ *     accumulator; both then mean the same thing downstream.
+ *
+ *     This exists because the camera had no player authority at all. The basis
+ *     the move stick resolves against was a damped follow of the character's
+ *     own facing, which makes it a unity-gain loop: the stick asks for facing
+ *     plus phi, facing slews there, the basis follows, the request is still
+ *     facing plus phi. Measured with tools/capture/_circle.mjs — holding A for
+ *     six seconds turned 2.12 full revolutions and was still turning at 112
+ *     deg/s, and holding W plus a light A orbited at 24 deg/s forever. Every
+ *     lateral input was a circle with no way to stop turning. The camera needs
+ *     its own yaw for that to have a fixed point, and a camera with its own yaw
+ *     needs a way for the player to aim it. See `CameraDirector.inputYaw`.
+ *
  * The whole struct is also settable from outside, which is how the capture
  * harness drives the game to an exact moment without touching the DOM.
  */
@@ -104,7 +123,13 @@ const DEFAULT_BINDINGS: Record<string, Action> = {
   KeyR: 'reset',
   KeyB: 'lookBack',
   Escape: 'pause',
+  // Enter USED to be bound straight to `restart`, and a single tap threw the run
+  // away from anywhere — including mid-descent, and including the frame after a
+  // results screen appeared. `Game.handleUiInput` now requires a hold, and the
+  // HUD draws the hold as it fills. KeyR ('reset') is still the instant one,
+  // because it only moves the character back to the line.
   Enter: 'restart',
+  NumpadEnter: 'restart',
   KeyV: 'toggleCam',
   Backquote: 'toggleDebug',
 };
@@ -121,11 +146,47 @@ export interface PlayerIntent {
   moveX: number;
   /** -1 (toward the camera) .. +1 (away from it), camera space. */
   moveZ: number;
+  /**
+   * Radians of yaw the player has asked the camera for since the last drain.
+   *
+   * A DELTA, not an axis — see design point 3. Positive is a look to the right.
+   * `Game` reads it and zeroes it every frame; a consumer that forgets to zero
+   * it gets an ever-growing request and a camera that spins, so the drain lives
+   * in exactly one place (`Input.drainLook`).
+   */
+  lookX: number;
+  /** Radians of pitch since the last drain. Positive looks DOWN. */
+  lookY: number;
   /** Raw button states for edge-sensitive logic. */
   buttons: Record<Action, ButtonState>;
   /** True while any gamepad is providing input — HUD swaps its prompts. */
   usingGamepad: boolean;
+  /** True while the pointer is locked to the canvas — the HUD shows a hint. */
+  pointerLocked: boolean;
 }
+
+/**
+ * Look sensitivity.
+ *
+ * The mouse figure is radians per device pixel of `movementX`. 0.0026 puts a
+ * 180 deg turn at about 1200 px of travel, which is a normal third-person
+ * setting and slow enough that the character's own turn rate is still the thing
+ * limiting a corner rather than the wrist.
+ *
+ * The pad figure is radians per second at full stick, and is deliberately well
+ * under `RUN.turnRateHigh` (2.2 rad/s): a right stick that can rotate the basis
+ * faster than the character can turn re-creates the runaway loop by hand.
+ */
+export const LOOK = {
+  mousePerPixel: 0.0026,
+  padRadPerSec: 1.9,
+  /** Deadzone on the right stick, which rests less cleanly than the left. */
+  padDeadzone: 0.16,
+  /** Multiplier on the vertical channel. Pitch wants less range than yaw. */
+  pitchScale: 0.62,
+  /** True inverts the vertical axis. */
+  invertY: false,
+} as const;
 
 export class Input {
   readonly intent: PlayerIntent;
@@ -134,6 +195,7 @@ export class Input {
   private releasedThisFrame = new Set<string>();
   private bindings: Record<string, Action>;
   private enabled = true;
+  private lockTarget: HTMLElement | null = null;
   /** When true, all hardware input is ignored and the harness drives `intent`. */
   scripted = false;
   private gamepadIndex: number | null = null;
@@ -145,8 +207,11 @@ export class Input {
     this.intent = {
       moveX: 0,
       moveZ: 0,
+      lookX: 0,
+      lookY: 0,
       buttons,
       usingGamepad: false,
+      pointerLocked: false,
     };
 
     const el = target as Window;
@@ -155,6 +220,81 @@ export class Input {
     window.addEventListener('blur', this.onBlur);
     window.addEventListener('gamepadconnected', this.onGamepadConnected as EventListener);
     window.addEventListener('gamepaddisconnected', this.onGamepadDisconnected as EventListener);
+    document.addEventListener('pointerlockchange', this.onPointerLockChange);
+    document.addEventListener('mousemove', this.onMouseMove as EventListener);
+  }
+
+  /**
+   * Give the mouse somewhere to lock to.
+   *
+   * Called with the renderer's canvas. Kept out of the constructor because this
+   * class deliberately knows nothing about the renderer, and because the capture
+   * harness constructs an `Input` with no canvas and must not acquire a pointer
+   * lock it never asked for.
+   *
+   * A click is the gesture, because `requestPointerLock` is only granted from a
+   * user gesture in every browser — there is no way to start already locked.
+   */
+  attachPointerLock(el: HTMLElement): void {
+    this.lockTarget = el;
+    el.addEventListener('mousedown', this.onMouseDown);
+  }
+
+  /** Release the mouse — for a pause menu, which wants a visible cursor. */
+  releasePointerLock(): void {
+    if (document.pointerLockElement) document.exitPointerLock();
+  }
+
+  private onMouseDown = (): void => {
+    if (!this.enabled || this.scripted) return;
+    if (this.lockTarget && !document.pointerLockElement) {
+      // Not awaited. The promise form is newer than the callback form and rejects
+      // on a gesture the browser did not like; either way `pointerlockchange` is
+      // the single source of truth for whether we are locked, so there is nothing
+      // useful to do with the result.
+      void (
+        this.lockTarget.requestPointerLock() as unknown as Promise<void> | undefined
+      )?.catch?.(() => {});
+    }
+  };
+
+  private onPointerLockChange = (): void => {
+    const locked = !!this.lockTarget && document.pointerLockElement === this.lockTarget;
+    this.intent.pointerLocked = locked;
+    // Losing the lock mid-motion would otherwise leave the last delta banked and
+    // apply it the next time the player locks back in, which reads as the camera
+    // flicking on click.
+    if (!locked) {
+      this.intent.lookX = 0;
+      this.intent.lookY = 0;
+    }
+  };
+
+  private onMouseMove = (e: MouseEvent): void => {
+    if (!this.enabled || this.scripted) return;
+    if (!this.intent.pointerLocked) return;
+    // `movementX/Y`, not a difference of `clientX/Y`: under a pointer lock the
+    // cursor does not move, so the client coordinates are frozen and a difference
+    // of them is always zero.
+    this.intent.lookX += e.movementX * LOOK.mousePerPixel;
+    this.intent.lookY +=
+      e.movementY * LOOK.mousePerPixel * LOOK.pitchScale * (LOOK.invertY ? -1 : 1);
+    this.intent.usingGamepad = false;
+  };
+
+  /**
+   * Read the accumulated look request and clear it.
+   *
+   * The clear is the point. `lookX` is a delta, so a caller that reads without
+   * clearing re-applies every mouse movement the player has ever made, every
+   * frame. Written into a caller-supplied pair to keep the per-frame path free of
+   * allocation.
+   */
+  drainLook(out: { x: number; y: number }): void {
+    out.x = this.intent.lookX;
+    out.y = this.intent.lookY;
+    this.intent.lookX = 0;
+    this.intent.lookY = 0;
   }
 
   private onKeyDown = (e: KeyboardEvent): void => {
@@ -262,6 +402,14 @@ export class Input {
       i.moveX = deadzone(pad.axes[0] ?? 0, 0.12);
       i.moveZ = -deadzone(pad.axes[1] ?? 0, 0.12);
       i.usingGamepad = true;
+
+      // The right stick, integrated into the same delta the mouse writes to. A
+      // stick is a LEVEL, so it has to be multiplied by dt to become the same
+      // quantity a mouse movement already is.
+      const rx = deadzone(pad.axes[2] ?? 0, LOOK.padDeadzone);
+      const ry = deadzone(pad.axes[3] ?? 0, LOOK.padDeadzone);
+      i.lookX += rx * LOOK.padRadPerSec * dt;
+      i.lookY += ry * LOOK.padRadPerSec * LOOK.pitchScale * dt * (LOOK.invertY ? -1 : 1);
     } else {
       this.synthMoveFromButtons();
     }
@@ -317,6 +465,8 @@ export class Input {
       const i = this.intent;
       i.moveX = 0;
       i.moveZ = 0;
+      i.lookX = 0;
+      i.lookY = 0;
       for (const a of ACTIONS) {
         const b = i.buttons[a];
         b.pressed = b.justPressed = b.justReleased = false;
@@ -352,6 +502,9 @@ export class Input {
     window.removeEventListener('blur', this.onBlur);
     window.removeEventListener('gamepadconnected', this.onGamepadConnected as EventListener);
     window.removeEventListener('gamepaddisconnected', this.onGamepadDisconnected as EventListener);
+    document.removeEventListener('pointerlockchange', this.onPointerLockChange);
+    document.removeEventListener('mousemove', this.onMouseMove as EventListener);
+    this.lockTarget?.removeEventListener('mousedown', this.onMouseDown);
   }
 }
 

@@ -49,6 +49,13 @@ for (const [name, d0, mx] of [['start', 100, 0], ['scree46', 380, 0], ['switchba
     return {
       mode: P.mode,
       h: +Math.hypot(P.velocity.x, P.velocity.z).toFixed(2),
+      // The 3D magnitude next to the horizontal one, because the gap between
+      // them IS the grade and several effects were ramped against the wrong one.
+      s3: +P.speed.toFixed(2),
+      // What the speed-line post effect actually publishes, so the frame can be
+      // read against a number instead of an impression of how bright it looks.
+      lines: +(window.__DESCENT__.POST_STATE?.speedLineIntensity ??
+               -1).toFixed(3),
       crab: +(wrap(travel - P.facing) * 180 / Math.PI).toFixed(1),
       inputLead: +(wrap(c.yaw - P.facing) * 180 / Math.PI).toFixed(1),
       lensLead: +(wrap(c.lensYaw - P.facing) * 180 / Math.PI).toFixed(1),

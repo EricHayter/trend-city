@@ -247,7 +247,13 @@ export function tubeGeometry(
       const b = i * radial + k2;
       const c = (i + 1) * radial + k;
       const d = (i + 1) * radial + k2;
-      idx.push(a, c, b, b, c, d);
+      // Wound outward. The ring's vertex k advances toward +up, so the quad's
+      // face normal is `tangent x phi` -- which is -radial, i.e. INWARD, if the
+      // triangles are pushed in ring order. Every rail in the scene measured a
+      // negative signed volume because of it, and a reversed closed mesh makes
+      // the BackSide inverted-hull outline paint the whole tube solid black:
+      // the rails read as a black scribble instead of metal.
+      idx.push(a, b, c, b, d, c);
     }
   }
 

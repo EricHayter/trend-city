@@ -188,9 +188,17 @@ export class WallSet implements IWallSet {
 
       // Slight overlap so a curved chain has no wedge of daylight at a joint.
       const geo = slabGeometry(l + 0.4, h, WALL_THICKNESS);
-      _ax.set(ux, 0, uz);
       _ay.set(0, 1, 0);
       _az.set(nx, 0, nz);
+      // Right-handed by construction. `_ax.set(ux, 0, uz)` reads as equivalent
+      // and is not: `seg` sign-matches the perpendicular against the authored
+      // outward normal, so on roughly half the panels (dir, up, normal) is a
+      // LEFT-handed triple with determinant -1, and `applyMatrix4` then mirrors
+      // the slab and reverses every triangle. The cel material is double-sided
+      // so it hides that; the inverted-hull outline is BackSide and paints the
+      // whole plate solid black. `up x normal` is +-dir, geometrically identical
+      // for a slab symmetric about its own centre, and always determinant +1.
+      _ax.crossVectors(_ay, _az).normalize();
       _m.makeBasis(_ax, _ay, _az);
       _m.setPosition(cx - nx * WALL_THICKNESS * 0.5, panel.baseY + h * 0.5, cz - nz * WALL_THICKNESS * 0.5);
       geo.applyMatrix4(_m);
@@ -209,9 +217,17 @@ export class WallSet implements IWallSet {
       const nx = panel.seg[i * 2];
       const nz = panel.seg[i * 2 + 1];
       const geo = slabGeometry(l + 0.3, 0.34, 0.16);
-      _ax.set(ux, 0, uz);
       _ay.set(0, 1, 0);
       _az.set(nx, 0, nz);
+      // Right-handed by construction. `_ax.set(ux, 0, uz)` reads as equivalent
+      // and is not: `seg` sign-matches the perpendicular against the authored
+      // outward normal, so on roughly half the panels (dir, up, normal) is a
+      // LEFT-handed triple with determinant -1, and `applyMatrix4` then mirrors
+      // the slab and reverses every triangle. The cel material is double-sided
+      // so it hides that; the inverted-hull outline is BackSide and paints the
+      // whole plate solid black. `up x normal` is +-dir, geometrically identical
+      // for a slab symmetric about its own centre, and always determinant +1.
+      _ax.crossVectors(_ay, _az).normalize();
       _m.makeBasis(_ax, _ay, _az);
       _m.setPosition(cx + nx * 0.09, panel.baseY + WALL_TUNING.stripeHeight, cz + nz * 0.09);
       geo.applyMatrix4(_m);

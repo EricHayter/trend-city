@@ -430,7 +430,25 @@ export class MenuScreen extends Widget {
 
     if (this.kind === 'results' && m.results) this.buildRows(m.results);
 
-    this.present(this.kind !== 'none', dt, 0.075);
+    // A MENU NEVER ANIMATES OUT, and this is the whole of the "overlapping modals
+    // and status menus on every restart" report.
+    //
+    // Every exit this widget has is an exit into gameplay: Title to Countdown,
+    // Paused to Running, Results to Countdown on a restart. There is nothing for
+    // an outgoing menu to transition to except the game, and the game is already
+    // behind it, so any frame the menu spends leaving is a frame with two modals
+    // up. The original `present` damped out over ~0.2 s, which put the PREVIOUS
+    // run's finish times over a fresh countdown for twelve frames on every single
+    // restart. `presentCut` was tried next and is not the fix either: it holds
+    // full alpha until `vis` crosses the floor, so it traded twelve translucent
+    // frames for three opaque ones. Measured with tools/capture/_restart.mjs —
+    // `worstModalOverlap: 2`, `["countdown", "menu"]`, at frame 0, on all five
+    // restarts.
+    //
+    // The entrance still animates, because an arriving menu has something real to
+    // arrive over.
+    if (this.kind === 'none') this.snapOff();
+    else this.present(true, dt, 0.05);
 
     // While the rows stagger in the layer must redraw; after 1.4s it settles to
     // the blink rate and stops costing anything.

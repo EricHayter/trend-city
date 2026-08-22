@@ -237,12 +237,70 @@ export const RUN = {
    * Yaw rate, rad/s, at rest and at top speed.
    *
    * Turning authority falls off with speed. This is what makes momentum a
-   * resource rather than a number: at 74 m/s the character needs 34 m of
-   * radius to make a 90° turn, so a corner has to be set up before it arrives.
+   * resource rather than a number: a corner has to be set up before it arrives.
    * Interpolated on speed / `max`, not on a curve — linear is legible.
+   *
+   * THE RADIUS THESE PRODUCE IS 9.2 m, NOT 34 m. This comment used to quote 34,
+   * from `74 / 2.2`, and 74 was the top speed back when Spark's units were being
+   * read as metres — the mistake `SPARK_UNIT_METRES` exists to correct, and the
+   * one the block at the top of this file lists "the character could not steer"
+   * among the symptoms of. Top speed is 20.17 m/s, so `max / turnRateHigh` is
+   * 9.2 m against a corridor whose core is 100 m wide, and the rates below need
+   * no adjustment at all. Left uncorrected the number reads as the design intent
+   * and invites someone to scale these up to restore it, which would put the
+   * radius back where the character cannot hold the route.
    */
-  turnRateLow: 12.0,
-  turnRateHigh: 2.2,
+  // 5.0, not 12.0. These now steer the MODEL only -- which way the character is
+  // pointing -- and the velocity is steered by `grip` below. 12.0 rad/s is
+  // 687 deg/s, and because the old model rebuilt the velocity along the heading
+  // every step, that was also the rate the character's PATH could change: at any
+  // speed under about a third of `max` the direction of travel was an instant
+  // function of the stick angle. "Moving is still too abrupt and janky" and
+  // "No momentum" are both that number.
+  turnRateLow: 5.0,
+  turnRateHigh: 2.6,
+
+  /**
+   * GRIP. How fast the across-the-input part of the velocity is bled off, m/s².
+   *
+   * This is where momentum lives, and it replaces a model that could not have any.
+   *
+   * The old grounded step read `h = hypot(velocity.x, velocity.z)`, steered a
+   * heading, and then wrote `velocity.x = sin(heading) * h`. Velocity direction
+   * was therefore IDENTICAL to facing, every step, by construction — there was
+   * no state in which the character was travelling in one direction and pointing
+   * in another, so there was nothing for momentum to be a property of. Turning
+   * cost nothing but the turn rate, releasing the stick preserved a speed
+   * pointed wherever the model happened to face, and the slope term's lateral
+   * push was folded straight back into forward speed by the next step's `hypot`
+   * — the mountain pumped the player rather than deflecting them.
+   *
+   * Now the horizontal velocity is decomposed against the requested direction:
+   * the ALONG component accelerates and is capped, the ACROSS component is bled
+   * at this rate and nothing else touches it. Running straight the across term
+   * is zero and this model is arithmetically identical to the old one. Turn, and
+   * the character carries what they had across the new direction and arcs out of
+   * it, losing the speed the turn actually cost instead of a flat 55% toll at
+   * 135 degrees.
+   *
+   * 24.0 spark-units/s² is 6.5 m/s². At top speed a 90 degree stick change puts
+   * all 20.2 m/s across the new direction, so it takes about 3.1 s to fully
+   * commit while the along component builds at `accelHigh` — a wide, fast arc
+   * that has to be planned. A 30 degree correction puts 10.1 m/s across and
+   * settles in 1.5 s, which reads as weight rather than lag.
+   */
+  grip: sparkAccel(24.0),
+  /**
+   * Grip while sliding. A slide is the drift: it keeps speed (`SLIDE.friction`)
+   * and it does not bite, so it carries you wide.
+   */
+  gripSlide: sparkAccel(7.0),
+  /**
+   * Grip floor, m/s². Below walking pace there is no momentum worth modelling
+   * and a platformer needs its footwork crisp, so grip rises as speed falls.
+   */
+  gripLowSpeed: sparkSpeed(14.0),
+  gripLowScale: 3.4,
 
   /**
    * How sharply velocity is allowed to snap to a new heading below this speed,
@@ -256,6 +314,33 @@ export const RUN = {
    * Spark 3 lets you reverse direction at cost rather than forbidding it.
    */
   quickTurnKeep: 0.45,
+
+  /**
+   * Seconds the reversed stick must be held before a pivot commits.
+   *
+   * The pivot used to fire off a SINGLE step's stick reading. At 120 Hz that is
+   * an 8 ms window, so any transient that put the request more than 135 deg off
+   * the heading — a diagonal flicked through, the basis swinging under a held
+   * key, a rail exit re-seating `facing` — threw away 55% of the player's speed
+   * and snapped the model round. Measured with tools/capture/_playthrough.mjs:
+   * a route-following controller tripped it on a roughly two-second cycle, and
+   * the speed trace is a sawtooth between 20.2 and 8.4 m/s (20.2 x 0.45 = 9.1)
+   * that made 2.3 m/s of progress out of 14 m/s of running.
+   *
+   * Eight steps of agreement is still instant to a player — it is under a frame
+   * and a half at 60 Hz — and it is long enough that nothing transient survives.
+   */
+  pivotHold: 0.065,
+
+  /**
+   * Seconds a committed pivot takes to bring the model round.
+   *
+   * It used to take none: `heading = wishYaw` in one step, which is a 180 deg
+   * rotation of the character in 8 ms and reads exactly as "abrupt and janky"
+   * however good the animation on top of it is. Short enough to still be a
+   * quick-turn rather than a slow arc, long enough to be a movement.
+   */
+  pivotTime: 0.13,
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +598,22 @@ export const GRIND = {
   /** Metres of vertical reach for a mount from above. */
   snapHeight: 3.2,
 
-  /** m/s. Minimum speed to hold a rail. Below it you fall off. */
+  /**
+   * m/s. Minimum speed to hold a rail. Below it you fall off.
+   *
+   * This sentence was true of the design and false of the code for the whole
+   * life of the grind: `minSpeed` was read in `tryMountRail` and in the prompt
+   * and NOWHERE in `stepGrinding`, so nothing ever fell off. The only exits a
+   * rail had were a jump, reaching one of its two ends, or the rail ceasing to
+   * exist. Take a rail that flattens or climbs and `GRIND.drag` walks
+   * `railSpeed` down to nothing while `railDistance` sits still between 0 and
+   * `len`, so the end-of-rail branch never fires and the character is parked
+   * mid-rail with no way off. That is the "getting stuck while rail grinding"
+   * report, and it is a hard stick rather than a stutter: with the speed at
+   * zero the velocity is zero, `facing` came off `atan2` of that velocity, and
+   * a zeroed facing also zeroes the input dot product that would otherwise let
+   * the player push themselves along. Stuck, facing north, controls dead.
+   */
   minSpeed: sparkSpeed(8.0),
   /** m/s. Mounting below this speed sets you to it — a rail never slows you. */
   mountFloor: sparkSpeed(26.0),
@@ -536,11 +636,63 @@ export const GRIND = {
   /** Seconds after dismounting before the same rail can be remounted. */
   lockout: 0.20,
 
+  /**
+   * Seconds of remount lockout after falling off a rail for being too slow.
+   *
+   * Longer than `lockout` on purpose. A jump-off is a deliberate exit that
+   * leaves at speed, so 0.2 s is plenty to clear `snapRadius`. A stall is the
+   * opposite: it drops you at `minSpeed`, 2.18 m/s, which covers 0.44 m in a
+   * `lockout` — well inside the 2.6 m snap. The rail would be re-grabbed the
+   * instant the ban expired, stall again a moment later, and the hard stick
+   * would come back as a 0.2 s buzz between Grinding and Airborne, which is
+   * worse to play than the original because it also makes noise. 0.6 s is 1.3 m
+   * at the stall speed and 12 m if the fall found a slope worth taking.
+   */
+  stallLockout: 0.6,
+
   /** Metres the character's feet ride above the rail's centreline. */
   rideHeight: 0.94,
 
   /** Lateral m/s the character can shuffle to switch to a parallel rail. */
   switchSpeed: sparkSpeed(9.0),
+
+  /**
+   * Seconds a rail must be ridden before another can be switched to.
+   *
+   * THIS IS THE FIX FOR "GETTING STUCK WHILE RAIL GRINDING", and the bug was not
+   * the one it looks like. `probeTraversal` runs `tryMountRail` on every step in
+   * every non-airborne mode, Grinding included, and `mountRail` re-seats
+   * `railDistance` and `position` from the new rail's mount point and the speed
+   * from `mountFloor`. Put two rails inside `snapRadius` of each other — which
+   * `Layout` can only discourage — and the character mounts the other one every
+   * single step: the same-index guard stops a rail remounting itself but says
+   * nothing about a pair taking turns.
+   *
+   * Measured with tools/capture/_railstuck.mjs. Rails 14 and 15 alternating at
+   * 120 Hz, `railDistance` bit-identical at 9.507659145808505 on every step,
+   * speed pinned at exactly `mountFloor`, y frozen at 326.27, for as long as the
+   * probe cared to run. In tools/capture/_playthrough.mjs it ate the last 110
+   * seconds of a 200-second run and 61.6% of every step in it, with the route
+   * distance stopped dead at 1150 of 2000 m.
+   *
+   * A cooldown alone is not enough and it is worth saying why: it only slows the
+   * rate at which progress is thrown away, because each switch still re-seats
+   * `railDistance`. It works here because it is paired with a ban on the rail
+   * just left, so the character is committed to the new rail long enough to
+   * actually travel along it — 0.5 s is 3.5 m at `mountFloor`, further than the
+   * 2.6 m `snapRadius` the pair were trading inside of.
+   */
+  switchCooldown: 0.5,
+
+  /**
+   * Stick deflection across the rail needed to ask for a switch.
+   *
+   * A switch the player did not ask for has no upside — the rail you are on is
+   * the rail you chose — and it has the failure above as its downside, so it is
+   * now a gesture rather than something proximity does to you. `switchSpeed`
+   * above has always described this as a shuffle; nothing read it.
+   */
+  switchAsk: 0.35,
 } as const;
 
 // ─────────────────────────────────────────────────────────────────────────────

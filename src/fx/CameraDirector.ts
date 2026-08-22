@@ -158,6 +158,7 @@ import {
   makeSpring,
   shortAngle,
   smoothstep,
+  wrapAngle,
   springStep,
   springStepDamped,
   type SpringState,
@@ -177,6 +178,8 @@ const _dirV = new Vector3();
 const _rightV = new Vector3();
 const _desired = new Vector3();
 const _lookWanted = new Vector3();
+/** Scratch for the grade query in `terrainFloorAt`, which runs twice a frame. */
+const _floorNormal = new Vector3();
 const _camFinal = new Vector3();
 const _lookFinal = new Vector3();
 const _shakeDir = new Vector3();
@@ -207,7 +210,9 @@ for (let i = 0; i < MAX_OCCLUDERS; i++) _occPos.push(new Vector3());
 
 export const CAMERA_TUNING = {
   fovBase: 62,
-  fovTop: 78,
+  // 71, not 78. A 16 degree lens sweep across the speed range is itself motion,
+  // and it is motion the player did not ask for and cannot predict.
+  fovTop: 71,
   /**
    * SHAPE OF THE SPEED→FOV CURVE, as `1 − (1 − s)^fovSaturation`.
    *
@@ -317,9 +322,13 @@ export const CAMERA_TUNING = {
 
   /** Position spring: under-damped, which is where the whip comes from. */
   chaseOmega: 6.2,
-  chaseZeta: 0.68,
+  // 1.0, critically damped. 0.68 was chosen for the overshoot -- the 'whip' the
+  // header talks about. Overshoot is what 'not at all smooth' feels like when
+  // the target is a character on rough ground rather than a car on a track: the
+  // rig arrives, passes the mark, and comes back, once per bump.
+  chaseZeta: 1.0,
   /** Look-at spring: critically damped and much stiffer, so framing stays solid. */
-  lookOmega: 11.0,
+  lookOmega: 13.0,
   /** Heading lag half-life at rest and at reference speed, seconds. */
   lagHalfLifeSlow: 0.19,
   lagHalfLifeFast: 0.40,
@@ -333,15 +342,20 @@ export const CAMERA_TUNING = {
    * turn, never turns at all", and they were reading it correctly: it turned,
    * but by an amount that could not be told apart from not turning.
    */
-  cornerSwing: 0.24,
-  cornerSwingMax: 3.2,
+  // 0.06, not 0.24. Lateral drift is driven by `yawRate * speed`, and `yawRate`
+  // is differentiated velocity heading -- the noisiest signal in the update. At
+  // 0.24 it slid the camera up to 3.2 m sideways off terrain deflection alone.
+  cornerSwing: 0.06,
+  cornerSwingMax: 0.9,
   /**
    * Camera roll per unit of lateral acceleration, radians. Same story: 0.0085
    * with a 0.12 cap gave 4.6 degrees at the peak of the sequence's hardest
    * corner. 0.026 / 0.30 gives 9.5 degrees there and 17 at the cap.
    */
-  rollGain: 0.026,
-  rollMax: 0.30,
+  // Roll is off in all but name. Spark 3 does not roll the camera, and rolling
+  // it off a differentiated noise signal tilts the horizon at random.
+  rollGain: 0.006,
+  rollMax: 0.09,
   /**
    * How much of the aim's velocity lead is bent around the corner, as a
    * fraction of `yawRate · leadTime`. The lead is a straight extrapolation of
@@ -364,6 +378,157 @@ export const CAMERA_TUNING = {
    * `inputYaw`.
    */
   inputYawHalfLife: 0.55,
+
+  // ── Who owns the yaw ───────────────────────────────────────────────────────
+  /**
+   * THE DEADZONE. Half-width, radians, of the cone inside which the camera does
+   * not yaw AT ALL.
+   *
+   * This is the single most important number in the file and it exists because
+   * of a report I could not fix by tuning: "Camera is just NOT WORKING PROPERLY?
+   * Even when I go forward, it is just not the right angle. It is constantly
+   * moving, working against me, and is a headache... The camera should barely
+   * move in fact."
+   *
+   * That is not a stiffness complaint and no half-life fixes it. It is a
+   * complaint about WHAT the camera is following. The anchor used to be a damped
+   * follow of the VELOCITY heading, with a 0.19-0.40 s half-life, unconditional
+   * and every frame. Velocity heading on a mountain is not a heading — it is a
+   * noise signal. Every slope deflection, every slide along a wall, every rail
+   * entry, every collision response yaws it, and the camera dutifully rotated to
+   * sit behind all of it. On a descent the fall line itself wanders, so the
+   * camera wandered even running dead straight. "Constantly moving, working
+   * against me" is an exact description of a unity-gain follow of a noisy
+   * signal.
+   *
+   * Spark the Electric Jester 3 does not do this, and the player's read of it is
+   * right: the yaw is THEIRS. The mouse turns the camera and nothing else does,
+   * except where the game has taken the wheel — a rail, a wall run — and even
+   * then slowly.
+   *
+   * So: inside `yawDeadzone` of travel the auto-yaw is exactly zero, not small.
+   * Zero is the whole point; a small number is still a camera that never settles
+   * and it is what the player was objecting to. 0.95 rad is 54 degrees, which
+   * covers ordinary running, strafing, terrain deflection and a full slide
+   * without the camera moving one pixel. Past the edge the assist fades in with
+   * the overshoot, so it is continuous rather than a cliff.
+   */
+  yawDeadzone: 0.95,
+  /**
+   * Half-life, seconds, of the auto-yaw once travel is OUTSIDE the deadzone.
+   *
+   * Long on purpose. This is the bail-out that stops a player who has turned
+   * 180 degrees from running at the lens forever; it is not a follow camera and
+   * it must never read as one. At 1.30 s a 90 degree turn recovers over roughly
+   * two and a half seconds of held input, which is slow enough to read as the
+   * world settling rather than the camera grabbing.
+   */
+  yawAssistHalfLife: 1.3,
+  /**
+   * The narrow case where the camera SHOULD align: the game is driving.
+   *
+   * On a rail or a wall run the character's direction is not a player choice, it
+   * is a property of the geometry, and a camera that stays where the player last
+   * left it points at the side of a rail. These are the "rare situations" —
+   * tighter deadzone, shorter half-life, still nothing like a unity follow.
+   */
+  yawPathDeadzone: 0.30,
+  yawPathHalfLife: 0.70,
+  /**
+   * Seconds after a look input before ANY auto-yaw resumes, and the fade after.
+   *
+   * The mouse must win outright while the hand is moving. Anything less and the
+   * assist and the player pull against each other, which is the sticky-camera
+   * feel the old `lookHold` comment describes and only half solved.
+   */
+  yawAssistHold: 1.1,
+  yawAssistFade: 0.8,
+
+  // ── The player's own camera ────────────────────────────────────────────────
+  /**
+   * THE GATE, and the reason the camera has an orbit at all.
+   *
+   * A damped follow of `facing` is UNITY gain, not positive gain, and a
+   * unity-gain loop preserves whatever offset it is handed: the stick asks for
+   * facing + phi, `facing` slews there, the basis follows `facing`, the request
+   * is still facing + phi. The steady state is therefore a CONSTANT ROTATION at
+   * `ln2 / inputYawHalfLife * phi`, and slowing the follow only slows the
+   * circle — it never produces a fixed point.
+   *
+   * Measured with tools/capture/_circle.mjs before this existed. Six seconds of
+   * held input, and the character was still turning at the end of all of them:
+   *
+   *     stick          deg/s at t=6s   revolutions
+   *     W                        0.0          0.00
+   *     W + light A             24.0          0.47
+   *     W + A                   55.9          1.07
+   *     A                      111.9          2.12
+   *
+   * 1.26 /s of follow times 1.555 rad of offset is 1.96 rad/s is 112 deg/s — the
+   * measurement to three figures, so the mechanism is not in doubt. Every
+   * lateral input was a circle and there was no way to turn and then stop
+   * turning, which is the whole of "movement feels stiff and janky".
+   *
+   * The fix is to SLOW the follow while the player is steering. Below
+   * `followGateLo` of requested angle the basis trails the character at full
+   * rate, which is what keeps the camera behind them down a straight. Above
+   * `followGateHi` it trails at `followFloor` of that rate, so a held stick
+   * traces a wide sweeping arc instead of a tight spin.
+   *
+   * IT IS A FLOOR AND NOT A GATE, and the first version of this was a gate — the
+   * weight went to a hard zero above `followGateHi` so the stick named a fixed
+   * world heading and the character turned to it and stopped. That has the exact
+   * fixed point the arithmetic above says it must, and it is unplayable for a
+   * reason the arithmetic does not mention: a basis that never follows during a
+   * turn never comes round behind a character holding a SUSTAINED one. The
+   * requested angle stays wherever it was, so the gate stays shut, so the basis
+   * stays put while the route keeps curving away from it — the offset grows
+   * without bound, and once it passes 135 deg the stick reads as a reversal and
+   * trips the pivot. Measured with tools/capture/_playthrough.mjs: the aiming
+   * trial went 203.7 m off the corridor inside 21 m of route distance with 94%
+   * of its steps in a slip, against 38.5 m and 86% for the unfixed build. A
+   * strictly worse failure, traded for a fixed point nobody asked for.
+   *
+   * So the follow never fully stops. 0.18 of 1.26 /s against 1.555 rad of offset
+   * is 0.35 rad/s, a 20 deg/s sweep and a 57 m radius at top speed rather than
+   * the 9 m one the ungated loop drove — wide enough to read as a turn the
+   * player chose, slow enough that an ordinary corner brings the camera round in
+   * about three seconds. Releasing the stick returns the weight to 1.
+   */
+  followGateLo: 0.22,
+  followGateHi: 0.62,
+  followFloor: 0.18,
+
+  /**
+   * Seconds the auto-recentre stays out of the way after a look input.
+   *
+   * Without it the recentre fights the mouse: the player pushes the basis 40 deg
+   * off the nose and it is pulled back while their hand is still moving, which
+   * reads as a sticky camera. Decayed rather than switched so the recentre fades
+   * back in rather than snapping on.
+   */
+  lookHold: 0.75,
+
+  /** Half-life, seconds, of the orbit decaying back behind the character. */
+  orbitRecentreHalfLife: 1.15,
+
+  /**
+   * Radians the player may swing the orbit either side of the chase.
+   *
+   * Not a full 360: the orbit ADDS to the stick basis, so a player who span it
+   * behind themselves would be pressing forward to run at the camera. A bit
+   * over a quarter turn each way is enough to look into a corner or check a
+   * drop, and past that the character should be turned instead.
+   */
+  // Unbounded now -- retained because the header arithmetic refers to it.
+  // The yaw IS the player's; clamping it to +-115 degrees meant a player who
+  // wanted to look back could not, and the clamp existed only because the
+  // orbit used to be an OFFSET from a velocity follow that no longer exists.
+  orbitYawMax: 2.0,
+
+  /** Pitch offset limits, as a tangent — arm rise per unit of arm length. */
+  orbitPitchMin: -0.34,
+  orbitPitchMax: 0.95,
 
   // ── Speed as an event ──────────────────────────────────────────────────────
   /**
@@ -417,7 +582,7 @@ export const CAMERA_TUNING = {
   // time, and 0.82 degrees of continuous angular shake at cruising speed is the
   // single biggest contributor to the game reading as unsmooth. This is a
   // punctuation mark on a fast run, not a texture over the whole game.
-  buffetDegrees: 0.34,
+  buffetDegrees: 0.12,
   /** Pitch and roll as fractions of the yaw amplitude. Yaw dominates. */
   buffetPitchFrac: 0.72,
   buffetRollFrac: 0.55,
@@ -429,11 +594,11 @@ export const CAMERA_TUNING = {
    * monitor. Measured: dropping it from 0.085 to 0.045 cost about 0.4 of
    * whole-frame delta on `scree-speed`, all of it in the near-ground band.
    */
-  buffetMetres: 0.040,
+  buffetMetres: 0.016,
   // 0.62, not 0.45. Where the buffet starts, as a fraction of
   // `referenceSpeed`. Pushed up so the bottom two thirds of the speed range are
   // completely still: the effect has to be ABSENT somewhere to read as arriving.
-  buffetFrom: 0.62,
+  buffetFrom: 0.84,
   /**
    * Buffet noise rates, features per second at the BOTTOM of the buffet's
    * range. Deliberately in the 4-7 Hz band and not lower: a 2 Hz wobble of the
@@ -477,8 +642,47 @@ export const CAMERA_TUNING = {
    * stranded at the far end of it.
    */
   boomMaxSlack: 3.0,
-  /** Terrain clearance required at the CAMERA end of the boom. */
+  /** Terrain clearance required at the CAMERA end of the boom, on flat ground. */
   terrainMargin: 1.15,
+  /**
+   * Terrain clearance on a face too steep to stand on, and the band it ramps in
+   * over, given as the surface normal's Y at the camera end.
+   *
+   * A FIXED clearance is a clearance measured in the wrong direction. It is a
+   * vertical offset above the heightfield, so on flat ground it is also the
+   * perpendicular distance from the surface and 1.15 m is a comfortable metre of
+   * air. On a 46 degree face the same 1.15 m vertical is 0.80 m perpendicular,
+   * and — much worse — the surface it is measured against is falling away
+   * steeply in front of the lens, so ground furniture a couple of metres ahead
+   * ends up nearly level with the camera instead of below it.
+   *
+   * Found by looking at a frame rather than at a number, which is the only way it
+   * could have been found. tools/capture/_motionseq.mjs frame 02 of the corner
+   * strip at d=435 is a red-edged V filling the screen with the character nowhere
+   * in it. tools/capture/_wedge.mjs then named it by projecting every traversal
+   * vertex through the camera's own view-projection matrix: `boost-mark-1`, a
+   * boost-pad chevron, nearest vertex 2.07 m from the lens. A 4.4 m wide decal at
+   * 2 m distance is wider than the frustum is at that depth, so it covers
+   * everything, and its inverted hull supplies the black.
+   *
+   * The camera was not doing anything wrong by its own rules: it sat at 1.19 m
+   * above the terrain, margin satisfied, while the terrain under it stood 4.7 m
+   * higher than the character's feet 4.5 m away. That is a chase camera on a 46
+   * degree descent — up-slope of the subject means down at surface level.
+   *
+   * So the clearance ramps with the grade. 2.60 m is not a free choice: it is
+   * `nearFadeStart`, the range at which this file already considers an object
+   * close enough to the lens to need treatment. Anything the terrain carries is
+   * now kept at least that far away, which is the same statement about the same
+   * distance.
+   *
+   * The band starts at 0.93 (21 degrees) rather than at `walkableNormalY`
+   * because the defect does not wait for unwalkable ground — the frame above is
+   * a slope the character was running down normally.
+   */
+  terrainMarginSteep: 2.60,
+  terrainMarginGradeLo: 0.93,
+  terrainMarginGradeHi: 0.72,
   /**
    * SIGHT-LINE clearance along the boom, ramped from `boomClearNear` at the
    * pivot end to `boomClearFar` at the camera end. It has to ramp: near the
@@ -813,13 +1017,19 @@ export const CAMERA_TUNING = {
    * been in range. 0.55 m of air with 0.26 s left is a real hop off a real
    * feature; anything under it is suspension travel.
    */
-  airSwingArc: 1.15,
+  // 0.20, not 1.15. 1.15 rad is 66 degrees of unrequested camera yaw on every
+  // jump that clears the trigger, and in a platformer that is most of them. It is
+  // also yaw the INPUT BASIS does not share -- `get yaw()` reads `inputYaw +
+  // playerOrbitYaw` and the swing is added to the anchor only -- so the picture
+  // rotated 66 degrees while forward stayed put, mid-air, with no way to correct
+  // for it. Kept as a small parallax garnish rather than a move.
+  airSwingArc: 0.20,
   airSwingMinAirTime: 0.06,
   airSwingMinRemaining: 0.26,
   airSwingMinPeak: 0.55,
   airSwingBailout: 0.13,
   airSwingCooldown: 1.5,
-  airSwingRise: 1.4,
+  airSwingRise: 0.45,
   /**
    * The arc is SCALED by the size of the jump, between these two peaks. A 66°
    * whip around a 0.6 m hop is a camera having a seizure; the same whip around
@@ -989,7 +1199,51 @@ export class CameraDirector implements ICameraDirector {
    * `PlayerInput.cameraYaw` can be fed this value directly.
    */
   get yaw(): number {
-    return this.inputYaw;
+    // `playerOrbitYaw` is IN here, and it has to be. This getter is what the move stick
+    // is resolved against, and the whole meaning of camera-relative input is that
+    // pushing the stick up runs the way the camera is pointing. Leave the player's
+    // own orbit out of the basis and the mouse would swing the view without
+    // changing what forward means, so the controls would stop matching the screen.
+    return wrapAngle(this.inputYaw + this.playerOrbitYaw);
+  }
+
+  /**
+   * Feed a look request. Radians, a DELTA — see `Input.drainLook`.
+   *
+   * Called from `Game` once per rendered frame, before `update()`. Positive `dx`
+   * looks right; positive `dy` raises the camera, so the caller inverts a mouse
+   * whose Y grows downward if that is what the player expects.
+   */
+  look(dx: number, dy: number): void {
+    if (dx === 0 && dy === 0) return;
+    // Unbounded. This was clamped to +-orbitYawMax because the orbit used to be
+    // an OFFSET from a velocity follow, and a player who span it behind
+    // themselves would have been pressing forward to run at the lens. There is
+    // no follow to offset from any more and the basis IS the lens, so spinning
+    // round just turns you round, which is what a third-person camera does.
+    this.playerOrbitYaw = wrapAngle(this.playerOrbitYaw + dx);
+    this.playerOrbitPitch = clamp(
+      this.playerOrbitPitch - dy,
+      CAMERA_TUNING.orbitPitchMin,
+      CAMERA_TUNING.orbitPitchMax,
+    );
+    this.lookIdle = 0;
+  }
+
+  /**
+   * Tell the director what the player is asking the character to do.
+   *
+   * The raw camera-space stick, exactly as `PlayerIntent` holds it. Only the
+   * ANGLE is used: it decides whether the input basis is allowed to keep
+   * following the character's facing this frame, which is the difference between
+   * a turn that settles and a permanent orbit. See `CAMERA_TUNING.followGateLo`.
+   *
+   * A centred stick reports 0, which is full follow — the camera comes back to
+   * the shoulder when the player stops steering.
+   */
+  steer(moveX: number, moveZ: number): void {
+    const mag = Math.hypot(moveX, moveZ);
+    this.steerAngle = mag < 0.08 ? 0 : Math.abs(Math.atan2(moveX, moveZ));
   }
 
   /** Where the finished lens points. Not the input basis — see `inputYaw`. */
@@ -1076,6 +1330,43 @@ export class CameraDirector implements ICameraDirector {
    *     rather than a marginal one.
    */
   private inputYaw = 0;
+
+  /**
+   * The player's own yaw offset, relative to where the chase would sit.
+   *
+   * Mouse and right stick write here through `look()`. Two jobs, and the second
+   * is the one that fixes steering:
+   *
+   *   - It gives the player a camera. There was none: no mouse handler existed
+   *     anywhere in the project and `PlayerIntent` had no look channel.
+   *   - It is a yaw that does NOT follow `facing`, which is what a
+   *     camera-relative control scheme needs in order to have a fixed point at
+   *     all. See `CAMERA_TUNING.followGateLo` for the measurement.
+   *
+   * Recentres toward 0 on `orbitRecentreHalfLife` once `lookIdle` has run past
+   * `lookHold`, so a player who never touches the mouse gets exactly the old
+   * behind-the-shoulder chase.
+   */
+  private playerOrbitYaw = 0;
+
+  /** Player pitch offset, as a tangent. Positive raises the camera. */
+  private playerOrbitPitch = 0;
+
+  /** Seconds since the last look input. Gates the auto-recentre. */
+  private lookIdle = 99;
+
+  /**
+   * How much of the auto-follow is live, 0..1.
+   *
+   * Driven off the size of the steering request, smoothed so it does not chatter
+   * on a stick hovering at the gate. Stored because the value is needed a frame
+   * later than the input that sets it — `look()` and `steer()` are called from
+   * `Game` before `update()` runs.
+   */
+  private followWeight = 1;
+
+  /** Last steering request magnitude, in radians of angle off the basis. */
+  private steerAngle = 0;
 
   /**
    * The subject's spin rate about up, differenced from `facing`.
@@ -1569,18 +1860,71 @@ export class CameraDirector implements ICameraDirector {
     const instRate = dt > 1e-4 ? clamp(dYaw / dt, -6, 6) : this.yawRate;
     this.yawRate = dampHL(this.yawRate, instRate, 0.09, dt);
 
-    // Under crash focus the lag half-life collapses: the whip is the right
-    // language for a corner and the wrong one for a wreck, where the only job
-    // is to hold the subject.
-    const lagHL =
-      lerp(CAMERA_TUNING.lagHalfLifeSlow, CAMERA_TUNING.lagHalfLifeFast, speed01) *
-      lerp(1, 0.45, cf);
-    this.aimYaw = dampAngleHL(this.aimYaw, travelYaw, lagHL, dt);
+    // ── THE ASSIST ────────────────────────────────────────────────────────────
+    //
+    // The camera's yaw belongs to the PLAYER (`playerOrbitYaw`, driven only by
+    // `look()`). This block is the sole other thing that can move it, and it is
+    // built to be off almost all of the time.
+    //
+    // What used to be here was `aimYaw = dampAngleHL(aimYaw, travelYaw, 0.19-0.40s)`
+    // — an unconditional, every-frame, unity-gain follow of the VELOCITY
+    // heading, with a follow of `facing` for the input basis stacked on top of
+    // it. See `CAMERA_TUNING.yawDeadzone` for the measurement of why that is the
+    // wrong thing to follow rather than a follow that needs slowing down, and
+    // for the report it produced.
+    //
+    // The input basis is now the lens, exactly — see the end of this block. That
+    // deletes the `facing` loop entirely, and with it the whole `followWeight` /
+    // `followGate` apparatus that existed to keep a unity-gain feedback loop from
+    // spinning. There is no loop left to gate: nothing the character does feeds
+    // back into the camera's yaw.
+    this.lookIdle += dt;
 
-    // THE INPUT BASIS. Deliberately the dullest line in the file: a plain
-    // damped follow of `facing`, with none of the whip, the lead or the buffet
-    // that the rest of this update is built to produce. See `inputYaw`.
-    this.inputYaw = dampAngleHL(this.inputYaw, t.facing, CAMERA_TUNING.inputYawHalfLife, dt);
+    // The narrow case where the camera should align itself: the game is driving.
+    // On a rail or a wall the direction is a property of the geometry rather than
+    // a player choice, and a camera left where the player last pointed it looks
+    // at the side of the rail.
+    const pathDriven = t.mode === MoveMode.Grinding || t.mode === MoveMode.WallRun;
+    const dead = pathDriven ? CAMERA_TUNING.yawPathDeadzone : CAMERA_TUNING.yawDeadzone;
+    const assistHL = pathDriven
+      ? CAMERA_TUNING.yawPathHalfLife
+      : CAMERA_TUNING.yawAssistHalfLife;
+
+    // The mouse wins outright while the hand is moving, then the assist fades
+    // back rather than snapping on.
+    const handOff = clamp01(
+      (this.lookIdle - CAMERA_TUNING.yawAssistHold) / CAMERA_TUNING.yawAssistFade,
+    );
+    // Standing still has no travel direction worth aligning to, and a nudge or a
+    // slide at walking pace is not a turn.
+    const moving = clamp01((planar - 2.0) / 3.0);
+
+    // Measured against the LENS, not against `aimYaw`. The deadzone is a claim
+    // about what the player can SEE, and the player sees `aimYaw + orbit`; using
+    // `aimYaw` alone lets the two drift until the assist fires on a picture that
+    // looked perfectly fine.
+    const lensErr = shortAngle(this.aimYaw + this.playerOrbitYaw, travelYaw);
+    const over = Math.abs(lensErr) - dead;
+    if (over > 0 && handOff > 1e-3 && moving > 1e-3) {
+      // Faded in with the overshoot, so the edge of the deadzone is a ramp and
+      // not a step — a hard edge there reads as the camera flinching.
+      const gain = clamp01(over / 0.55) * handOff * moving * lerp(1, 0.35, cf);
+      // Aim at the EDGE of the deadzone, not at `travelYaw`. Recovering only as
+      // far as it has to means the camera stops the moment the character is back
+      // in frame instead of continuing round to sit on their shoulder — the
+      // difference between an assist and the follow camera this replaced.
+      const want = wrapAngle(this.aimYaw + lensErr - Math.sign(lensErr) * dead);
+      this.aimYaw = dampAngleHL(this.aimYaw, want, assistHL / gain, dt);
+    }
+
+    // THE INPUT BASIS: the lens, to the radian, with no follow and no lag.
+    //
+    // Camera-relative control means "up on the stick runs where the camera is
+    // pointing", and the only implementation of that sentence which cannot drift
+    // is the identity. The previous damped follow of `facing` meant the basis and
+    // the picture disagreed by however far the follow was behind, so a held
+    // direction curved.
+    this.inputYaw = this.aimYaw;
 
     // Air framing: pull back and rise so the whole arc is legible.
     const airborne = t.mode === MoveMode.Airborne;
@@ -1602,7 +1946,13 @@ export class CameraDirector implements ICameraDirector {
       airLift +
       CAMERA_TUNING.crashFocusRise * cf;
 
-    const anchorYaw = this.aimYaw + this.swingAmount * this.swingDir * this.swingArc;
+    // `playerOrbitYaw` is added to the ANCHOR as well as to the basis. Both, or the two
+    // halves disagree: in the basis alone the stick would rotate under a view
+    // that never moved, and in the anchor alone the view would swing while
+    // forward stayed put. The camera orbits the character and the stick follows
+    // the camera, which is the one arrangement that matches the screen.
+    const anchorYaw =
+      this.aimYaw + this.playerOrbitYaw + this.swingAmount * this.swingDir * this.swingArc;
     _dirV.set(Math.sin(anchorYaw), 0, Math.cos(anchorYaw));
     // right = dir x up.
     _rightV.set(-_dirV.z, 0, _dirV.x);
@@ -1640,7 +1990,13 @@ export class CameraDirector implements ICameraDirector {
       height +
       this.swingAmount *
         CAMERA_TUNING.airSwingRise *
-        (this.swingArc / CAMERA_TUNING.airSwingArc);
+        (this.swingArc / CAMERA_TUNING.airSwingArc) +
+      // The player's pitch, as a tangent times the arm length, so the offset is
+      // an ANGLE rather than a fixed number of metres — it holds the same framing
+      // whether the arm is at its close standoff or stretched out at speed.
+      // Applied to the rise only and not to the look point: raising the camera
+      // while it keeps aiming at the character IS pitching down.
+      this.playerOrbitPitch * dist;
     _desired
       .copy(t.position)
       .addScaledVector(_dirV, -dist)
@@ -2422,6 +2778,14 @@ export class CameraDirector implements ICameraDirector {
     this.aimYaw = 0;
     this.yawRate = 0;
     this.inputYaw = target.facing;
+    // The player's orbit is part of the rig's state and a re-seat has to clear it,
+    // or a respawn puts the character on the line with the camera still swung 90
+    // deg off the nose from wherever they were looking when they died.
+    this.playerOrbitYaw = 0;
+    this.playerOrbitPitch = 0;
+    this.lookIdle = 99;
+    this.followWeight = 1;
+    this.steerAngle = 0;
 
     // SPEED FROM THE VELOCITY, NOT FROM `state.speed`.
     //
@@ -2737,7 +3101,7 @@ export class CameraDirector implements ICameraDirector {
     // Final unconditional floor, including the shake: whatever else happened,
     // the camera is not inside the hillside.
     if (this.terrain && this.mode !== CameraMode.Free && this.mode !== CameraMode.Fixed) {
-      const h = this.terrain.heightAt(_camFinal.x, _camFinal.z) + CAMERA_TUNING.terrainMargin;
+      const h = this.terrainFloorAt(_camFinal.x, _camFinal.z);
       if (_camFinal.y < h) _camFinal.y = h;
     }
 
@@ -2873,7 +3237,7 @@ export class CameraDirector implements ICameraDirector {
     // `depth / s` amplification that sent the camera 32 m into the sky.
     let need = 0;
     if (this.terrain) {
-      const h = this.terrain.heightAt(cam.x, cam.z) + CAMERA_TUNING.terrainMargin;
+      const h = this.terrainFloorAt(cam.x, cam.z);
       if (cam.y < h) need = h - cam.y;
     }
     const clear = CAMERA_TUNING.occluderLiftRadius;
@@ -3032,7 +3396,7 @@ export class CameraDirector implements ICameraDirector {
     const cz = pivot.z + Math.cos(azim) * ce * len;
 
     if (this.terrain) {
-      if (cy < this.terrain.heightAt(cx, cz) + CAMERA_TUNING.terrainMargin) return false;
+      if (cy < this.terrainFloorAt(cx, cz)) return false;
       const N = CAMERA_TUNING.framedClearSamples;
       for (let i = 1; i <= N; i++) {
         const s = i / (N + 1);
@@ -3082,7 +3446,7 @@ export class CameraDirector implements ICameraDirector {
   /** Raise a point clear of the hillside. No amplification, no state. */
   private floorCamera(cam: Vector3): void {
     if (!this.terrain) return;
-    const h = this.terrain.heightAt(cam.x, cam.z) + CAMERA_TUNING.terrainMargin;
+    const h = this.terrainFloorAt(cam.x, cam.z);
     if (cam.y < h) cam.y = h;
   }
 
@@ -3294,6 +3658,23 @@ export class CameraDirector implements ICameraDirector {
       err !== 0 ? CAMERA_TUNING.frameBiasCorrectHL : CAMERA_TUNING.frameBiasRelaxHL,
       dt,
     );
+  }
+
+  /**
+   * Height the camera may not go below at a point, grade-aware.
+   *
+   * Both places that floor the camera used `heightAt(x, z) + terrainMargin`
+   * directly and disagreeing about that number would be a bug, so it lives here.
+   * See `CAMERA_TUNING.terrainMarginSteep` for why the margin is not a constant.
+   */
+  private terrainFloorAt(x: number, z: number): number {
+    if (!this.terrain) return -Infinity;
+    const ny = this.terrain.normalAt(x, z, _floorNormal).y;
+    const steep = smoothstep(CAMERA_TUNING.terrainMarginGradeLo, CAMERA_TUNING.terrainMarginGradeHi, ny);
+    const margin =
+      CAMERA_TUNING.terrainMargin +
+      (CAMERA_TUNING.terrainMarginSteep - CAMERA_TUNING.terrainMargin) * steep;
+    return this.terrain.heightAt(x, z) + margin;
   }
 
   /**
